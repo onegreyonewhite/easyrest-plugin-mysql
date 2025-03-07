@@ -2,14 +2,14 @@
 
 The **EasyREST MySQL Plugin** is an external plugin for [EasyREST](https://github.com/onegreyonewhite/easyrest) that enables EasyREST to connect to and perform CRUD operations on MySQL databases. This plugin implements the `easyrest.DBPlugin` interface using a MySQL connection pool, session variable injection for context propagation, and transactional stored procedure execution.
 
-> **Key Features:**
->
-> - **CRUD Operations:** Supports SELECT, INSERT, UPDATE, and DELETE queries.
-> - **Context Injection:** If query fields or conditions reference context variables (using the `erctx.` prefix), the plugin injects these values into session variables.
-> - **Stored Procedure Calls:** Executes stored procedures within a transaction, rolling back on error.
-> - **Connection Pooling:** Uses a MySQL connection pool for optimal performance, with special handling for session variables to avoid race conditions.
-> - **Deterministic SQL Generation:** Ensures predictable SQL statements by sorting map keys where necessary.
-> - **UTF8MB4 Support:** The plugin currently operates strictly with `utf8mb4` and `utf8mb4_general_ci` settings (subject to change in the future).
+**Key Features:**
+
+- **CRUD Operations:** Supports SELECT, INSERT, UPDATE, and DELETE queries.
+- **Context Injection:** If query fields or conditions reference context variables (using the `erctx.` prefix), the plugin injects these values into session variables.
+- **Stored Procedure Calls:** Executes stored procedures within a transaction, rolling back on error.
+- **Connection Pooling:** Uses a MySQL connection pool for optimal performance, with special handling for session variables to avoid race conditions.
+- **Deterministic SQL Generation:** Ensures predictable SQL statements by sorting map keys where necessary.
+- **UTF8MB4 Support:** The plugin currently operates strictly with `utf8mb4` and `utf8mb4_general_ci` settings (subject to change in the future).
 
 ---
 
