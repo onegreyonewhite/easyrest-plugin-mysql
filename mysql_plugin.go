@@ -17,7 +17,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.1.0"
+var Version = "v0.1.1"
 
 // rowScanner interface defines the methods we need from a rows object.
 type rowScanner interface {
