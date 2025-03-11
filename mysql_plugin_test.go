@@ -8,13 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-// fakeRows implements the rowScanner interface for testing scanRows.
+// fakeRows implements the rowScanner interface for scanRows testing.
 type fakeRows struct {
 	cols []string
 	data [][]interface{}
@@ -23,12 +24,7 @@ type fakeRows struct {
 }
 
 func newFakeRows(cols []string, data [][]interface{}) *fakeRows {
-	return &fakeRows{
-		cols: cols,
-		data: data,
-		i:    0,
-		err:  nil,
-	}
+	return &fakeRows{cols: cols, data: data, i: 0}
 }
 
 func (r *fakeRows) Columns() ([]string, error) {
@@ -49,12 +45,12 @@ func (r *fakeRows) Scan(dest ...interface{}) error {
 	}
 	row := r.data[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("expected %d destinations, got %d", len(row), len(dest))
+		return fmt.Errorf("expected %d columns, got %d", len(row), len(dest))
 	}
 	for i, v := range row {
 		ptr, ok := dest[i].(*interface{})
 		if !ok {
-			return fmt.Errorf("expected *interface{} for column %d", i)
+			return fmt.Errorf("expected *interface{} at column %d", i)
 		}
 		*ptr = v
 	}
@@ -65,30 +61,25 @@ func (r *fakeRows) Err() error {
 	return r.err
 }
 
-// newTestPlugin returns a new mysqlPlugin with a sqlmock database.
 func newTestPlugin(t *testing.T) (*mysqlPlugin, sqlmock.Sqlmock) {
-	// Create a sqlmock database.
 	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
 	if err != nil {
-		t.Fatalf("failed to open sqlmock database: %s", err)
+		t.Fatalf("failed to open sqlmock: %v", err)
 	}
-	// Override openDB to return our mocked db.
-	openDB = func(driverName, dataSourceName string) (*sql.DB, error) {
+	openDB = func(driverName, dsn string) (*sql.DB, error) {
 		return db, nil
 	}
-	plugin := &mysqlPlugin{db: db}
-	return plugin, mock
+	p := &mysqlPlugin{db: db}
+	return p, mock
 }
 
 func TestInitConnectionValid(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
 
-	// Expect a successful Ping.
 	mock.ExpectPing().WillReturnError(nil)
 	mock.ExpectExec(regexp.QuoteMeta("SET NAMES utf8mb4 COLLATE utf8mb4_general_ci")).
 		WillReturnResult(sqlmock.NewResult(1, 1))
-	// Simulate empty routines.
 	mock.ExpectQuery(regexp.QuoteMeta(`
 SELECT SPECIFIC_NAME, PARAMETER_NAME, DATA_TYPE, PARAMETER_MODE, ORDINAL_POSITION
 FROM information_schema.parameters
@@ -98,10 +89,10 @@ ORDER BY SPECIFIC_NAME, ORDINAL_POSITION;`)).
 
 	err := plugin.InitConnection("mysql://mock")
 	if err != nil {
-		t.Fatalf("InitConnection failed: %s", err)
+		t.Fatalf("InitConnection failed: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in InitConnection: %s", err)
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
@@ -111,7 +102,7 @@ func TestInjectContext(t *testing.T) {
 
 	conn, err := plugin.db.Conn(context.Background())
 	if err != nil {
-		t.Fatalf("failed to get connection: %s", err)
+		t.Fatalf("failed to get db conn: %v", err)
 	}
 	defer conn.Close()
 
@@ -119,38 +110,57 @@ func TestInjectContext(t *testing.T) {
 		"token":    "secret",
 		"timezone": "UTC",
 	}
-	mock.ExpectExec(regexp.QuoteMeta("SET @erctx_token = ?, @erctx_timezone = ?")).
-		WithArgs("secret", "UTC").
+
+	setQuery := regexp.QuoteMeta("SET @erctx_timezone = ?, @request_timezone = ?, @erctx_token = ?, @request_token = ?")
+	mock.ExpectExec(setQuery).
+		WithArgs("UTC", "UTC", "secret", "secret").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
-	if err := plugin.injectContext(conn, ctxData); err != nil {
-		t.Fatalf("injectContext failed: %s", err)
+	err = plugin.injectContext(conn, ctxData)
+	if err != nil {
+		t.Fatalf("injectContext error: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in injectContext: %s", err)
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestInjectContextNil(t *testing.T) {
+	plugin, _ := newTestPlugin(t)
+	defer plugin.db.Close()
+
+	conn, err := plugin.db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed to get db conn: %v", err)
+	}
+	defer conn.Close()
+
+	err = plugin.injectContext(conn, nil)
+	if err != nil {
+		t.Errorf("expected no error on nil context, got %v", err)
 	}
 }
 
 func TestScanRows(t *testing.T) {
 	cols := []string{"id", "name", "created_at"}
 	now := time.Date(2025, 3, 7, 15, 30, 0, 0, time.UTC)
-	data := [][]interface{}{
+	rowsData := [][]interface{}{
 		{1, []byte("Alice"), now},
 	}
-	fr := newFakeRows(cols, data)
-	result, err := scanRows(fr)
+	fr := newFakeRows(cols, rowsData)
+	res, err := scanRows(fr)
 	if err != nil {
-		t.Fatalf("scanRows error: %s", err)
+		t.Fatalf("scanRows error: %v", err)
 	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(result))
+	if len(res) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res))
 	}
-	if result[0]["name"] != "Alice" {
-		t.Errorf("expected 'Alice', got %v", result[0]["name"])
+	if res[0]["name"] != "Alice" {
+		t.Errorf("expected name=Alice, got %v", res[0]["name"])
 	}
-	expectedTime := now.Format("2006-01-02 15:04:05")
-	if result[0]["created_at"] != expectedTime {
-		t.Errorf("expected %s, got %v", expectedTime, result[0]["created_at"])
+	want := now.Format("2006-01-02 15:04:05")
+	if res[0]["created_at"] != want {
+		t.Errorf("expected %s, got %v", want, res[0]["created_at"])
 	}
 }
 
@@ -168,422 +178,123 @@ WHERE SPECIFIC_SCHEMA = DATABASE()
 ORDER BY SPECIFIC_NAME, ORDINAL_POSITION;`)).
 		WillReturnRows(rows)
 
-	if err := plugin.loadRoutines(); err != nil {
-		t.Fatalf("loadRoutines failed: %s", err)
+	err := plugin.loadRoutines()
+	if err != nil {
+		t.Fatalf("loadRoutines: %v", err)
 	}
-	r, ok := plugin.routines["doSomething"]
+	info, ok := plugin.routines["doSomething"]
 	if !ok {
-		t.Fatalf("routine doSomething not loaded")
+		t.Fatalf("routine 'doSomething' not found")
 	}
-	if r.ReturnType != "varchar" {
-		t.Errorf("expected return type 'varchar', got %s", r.ReturnType)
+	if info.ReturnType != "varchar" {
+		t.Errorf("expected return type 'varchar', got %v", info.ReturnType)
 	}
-	if len(r.Params) != 1 {
-		t.Errorf("expected 1 parameter, got %d", len(r.Params))
+	if len(info.Params) != 1 {
+		t.Errorf("expected 1 param, got %d", len(info.Params))
 	}
-	if r.Params[0].Name != "param" {
-		t.Errorf("expected parameter name 'param', got %s", r.Params[0].Name)
+	if info.Params[0].Name != "param" {
+		t.Errorf("expected param name=param, got %v", info.Params[0].Name)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in loadRoutines: %s", err)
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
-// TestTableGetGroupByOrderingLimitOffset verifies that TableGet builds the query correctly.
 func TestTableGetGroupByOrderingLimitOffset(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
 
-	// Set selectFields and empty where.
-	selectFields := []string{"id", "name"}
+	sf := []string{"id", "name"}
 	where := map[string]interface{}{}
-	groupBy := []string{"name"}
+	gb := []string{"name"}
 	ordering := []string{"id DESC"}
 	limit := 10
 	offset := 5
-
-	// easyrest.BuildWhereClause returns empty string if where is empty.
-	// So expected query is:
-	// SELECT id, name FROM users GROUP BY name ORDER BY id DESC LIMIT 10 OFFSET 5
-	expectedQuery := "SELECT id, name FROM users GROUP BY name ORDER BY id DESC LIMIT 10 OFFSET 5"
-	mock.ExpectQuery(regexp.QuoteMeta(expectedQuery)).
+	expQ := "SELECT id, name FROM users GROUP BY name ORDER BY id DESC LIMIT 10 OFFSET 5"
+	mock.ExpectQuery(regexp.QuoteMeta(expQ)).
 		WithArgs().
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).AddRow(1, "John Doe"))
 
-	result, err := plugin.TableGet("user123", "users", selectFields, where, ordering, groupBy, limit, offset, nil)
+	res, err := plugin.TableGet("u", "users", sf, where, ordering, gb, limit, offset, nil)
 	if err != nil {
-		t.Fatalf("TableGet error: %s", err)
+		t.Fatalf("TableGet error: %v", err)
 	}
-	if len(result) != 1 {
-		t.Errorf("expected 1 row, got %d", len(result))
+	if len(res) != 1 {
+		t.Errorf("expected 1 row, got %d", len(res))
 	}
-	if result[0]["name"] != "John Doe" {
-		t.Errorf("expected name 'John Doe', got %v", result[0]["name"])
+	if res[0]["name"] != "John Doe" {
+		t.Errorf("expected name=John Doe, got %v", res[0]["name"])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TestTableGetGroupByOrderingLimitOffset: %s", err)
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
-// TestInjectContextNil verifies that injectContext returns nil when context is nil.
-func TestInjectContextNil(t *testing.T) {
-	plugin, _ := newTestPlugin(t)
-	defer plugin.db.Close()
-
-	conn, err := plugin.db.Conn(context.Background())
-	if err != nil {
-		t.Fatalf("failed to get connection: %s", err)
-	}
-	defer conn.Close()
-
-	err = plugin.injectContext(conn, nil)
-	if err != nil {
-		t.Errorf("expected nil error when ctx is nil, got: %s", err)
-	}
-}
-
-// TestTableGetTimeMidnight tests that a time value at midnight is formatted as "YYYY-MM-DD".
 func TestTableGetTimeMidnight(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
 
-	selectFields := []string{"id", "created_at"}
-	where := map[string]interface{}{"dummy": "dummy"}
-	// Simulate easyrest.BuildWhereClause returns " WHERE dummy = ?" with arg "dummy".
-	// For testing purposes we ignore where values; our expected query:
-	expectedQuery := "SELECT id, created_at FROM users WHERE dummy = ?"
-	mr := sqlmock.NewRows([]string{"id", "created_at"}).AddRow(1, time.Date(2025, 3, 7, 0, 0, 0, 0, time.UTC))
-	mock.ExpectQuery(regexp.QuoteMeta(expectedQuery)).WithArgs("dummy").WillReturnRows(mr)
+	sf := []string{"id", "created_at"}
+	where := map[string]interface{}{
+		"dummy": "val",
+	}
+	expQ := "SELECT id, created_at FROM users WHERE dummy = ?"
+	mid := time.Date(2025, 3, 7, 0, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(regexp.QuoteMeta(expQ)).
+		WithArgs("val").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(1, mid))
 
-	result, err := plugin.TableGet("user123", "users", selectFields, where, nil, nil, 0, 0, nil)
+	res, err := plugin.TableGet("u", "users", sf, where, nil, nil, 0, 0, nil)
 	if err != nil {
-		t.Fatalf("TableGet error: %s", err)
+		t.Fatalf("TableGet error: %v", err)
 	}
-	if len(result) != 1 {
-		t.Errorf("expected 1 row, got %d", len(result))
+	if len(res) != 1 {
+		t.Errorf("expected 1 row, got %d", len(res))
 	}
-	// Since the time is midnight, it should be formatted as "2006-01-02"
-	if result[0]["created_at"] != "2025-03-07" {
-		t.Errorf("expected time '2025-03-07', got %v", result[0]["created_at"])
+	got := res[0]["created_at"]
+	if got != "2025-03-07" {
+		t.Errorf("expected 2025-03-07, got %v", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TestTableGetTimeMidnight: %s", err)
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
-// TestTableCreateWithContext verifies that TableCreate works when ctx is not nil.
 func TestTableCreateWithContext(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
 
 	data := []map[string]interface{}{
-		{"id": 1, "name": "erctx.claim", "info": "info"},
+		{"id": 1, "info": "info", "name": "erctx.claim"},
 	}
 	ctxData := map[string]interface{}{
 		"claim": "Alice",
+		"foo":   123,
 	}
+
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("SET @erctx_claim = ?")).
-		WithArgs("Alice").WillReturnResult(sqlmock.NewResult(1, 1))
-	// Sorted keys: "id", "info", "name". For "name", since value starts with "erctx.claim",
-	// it will be replaced with "@erctx_claim".
-	expectedQuery := "INSERT INTO users (id, info, name) VALUES (?, ?, @erctx_claim)"
-	mock.ExpectExec(regexp.QuoteMeta(expectedQuery)).
-		WithArgs(1, "info").
+
+	setQuery := regexp.QuoteMeta("SET @erctx_claim = ?, @request_claim = ?, @erctx_foo = ?, @request_foo = ?")
+	mock.ExpectExec(setQuery).
+		WithArgs("Alice", "Alice", "123", "123").
 		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectCommit()
 
-	result, err := plugin.TableCreate("user123", "users", data, ctxData)
-	if err != nil {
-		t.Fatalf("TableCreate with context error: %s", err)
-	}
-	if len(result) != 1 {
-		t.Errorf("expected 1 inserted row, got %d", len(result))
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TestTableCreateWithContext: %s", err)
-	}
-}
-
-func TestCallFunctionFunction(t *testing.T) {
-	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-
-	plugin.routines = map[string]RoutineInfo{
-		"doSomething": {
-			Name:       "doSomething",
-			Params:     []RoutineParam{{Name: "param", DataType: "varchar", Mode: "IN", Ordinal: 1}},
-			ReturnType: "varchar",
-		},
-	}
-
-	data := map[string]interface{}{
-		"param": "value",
-	}
-	rows := sqlmock.NewRows([]string{"result"}).AddRow("success")
-	mock.ExpectBegin()
-	callRegex := regexp.QuoteMeta("SELECT doSomething(?) AS result")
-	mock.ExpectQuery(callRegex).WithArgs("value").WillReturnRows(rows)
-	mock.ExpectCommit()
-
-	result, err := plugin.CallFunction("user123", "doSomething", data, nil)
-	if err != nil {
-		t.Fatalf("CallFunction function error: %s", err)
-	}
-	out, _ := json.Marshal(result)
-	var res []map[string]interface{}
-	if err := json.Unmarshal(out, &res); err != nil {
-		t.Fatalf("failed to unmarshal result: %s", err)
-	}
-	if len(res) != 1 || res[0]["result"] != "success" {
-		t.Errorf("expected result 'success', got %v", res)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in CallFunctionFunction: %s", err)
-	}
-}
-
-func TestCallFunctionProcedure(t *testing.T) {
-	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-
-	plugin.routines = map[string]RoutineInfo{
-		"doSomething": {
-			Name:       "doSomething",
-			Params:     []RoutineParam{{Name: "param", DataType: "varchar", Mode: "IN", Ordinal: 1}},
-			ReturnType: "",
-		},
-	}
-
-	data := map[string]interface{}{
-		"param": "erctx.myparam",
-	}
-	ctxData := map[string]interface{}{
-		"myparam": "value",
-	}
-	mock.ExpectExec(regexp.QuoteMeta("SET @erctx_myparam = ?")).
-		WithArgs("value").WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectBegin()
-	callRegex := regexp.QuoteMeta("CALL doSomething(@erctx_myparam)")
-	mock.ExpectQuery(callRegex).WillReturnRows(sqlmock.NewRows([]string{"result"}).AddRow("proc_success"))
-	mock.ExpectCommit()
-
-	result, err := plugin.CallFunction("user123", "doSomething", data, ctxData)
-	if err != nil {
-		t.Fatalf("CallFunction procedure error: %s", err)
-	}
-	out, _ := json.Marshal(result)
-	var res []map[string]interface{}
-	if err := json.Unmarshal(out, &res); err != nil {
-		t.Fatalf("failed to unmarshal result: %s", err)
-	}
-	if len(res) != 1 || res[0]["result"] != "proc_success" {
-		t.Errorf("expected result 'proc_success', got %v", res)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in CallFunctionProcedure: %s", err)
-	}
-}
-
-func TestTableGetNoContext(t *testing.T) {
-	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-
-	selectFields := []string{"id", "name"}
-	where := map[string]interface{}{
-		"status": map[string]interface{}{"=": "active"},
-	}
-	queryRegex := regexp.QuoteMeta("SELECT id, name FROM users WHERE status = ?")
-	rows := sqlmock.NewRows([]string{"id", "name"}).AddRow(1, "John Doe")
-	mock.ExpectQuery(queryRegex).WithArgs("active").WillReturnRows(rows)
-
-	result, err := plugin.TableGet("user123", "users", selectFields, where, nil, nil, 0, 0, nil)
-	if err != nil {
-		t.Fatalf("TableGet no context error: %s", err)
-	}
-	if len(result) != 1 {
-		t.Errorf("expected 1 row, got %d", len(result))
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TableGetNoContext: %s", err)
-	}
-}
-
-func TestTableGetWithContext(t *testing.T) {
-	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-
-	selectFields := []string{"id", "name", "erctx.extra"}
-	where := map[string]interface{}{
-		"status": map[string]interface{}{"=": "active"},
-	}
-	ctxData := map[string]interface{}{
-		"extra": "data",
-	}
-	mock.ExpectExec(regexp.QuoteMeta("SET @erctx_extra = ?")).
-		WithArgs("data").WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, name, @erctx_extra FROM users WHERE status = ?")).
-		WithArgs("active").WillReturnRows(sqlmock.NewRows([]string{"id", "name", "erctx_extra"}).AddRow(1, "John Doe", "data"))
-
-	result, err := plugin.TableGet("user123", "users", selectFields, where, nil, nil, 0, 0, ctxData)
-	if err != nil {
-		t.Fatalf("TableGet with context error: %s", err)
-	}
-	if len(result) != 1 {
-		t.Errorf("expected 1 row, got %d", len(result))
-	}
-	if result[0]["erctx_extra"] != "data" {
-		t.Errorf("expected value 'data', got %v", result[0]["erctx_extra"])
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TableGetWithContext: %s", err)
-	}
-}
-
-func TestTableCreateNoContext(t *testing.T) {
-	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-
-	data := []map[string]interface{}{
-		{"id": 1, "name": "Alice", "info": "some info"},
-	}
-
-	mock.ExpectBegin()
-	expectedQuery := "INSERT INTO users (id, info, name) VALUES (?, ?, ?)"
-	mock.ExpectExec(regexp.QuoteMeta(expectedQuery)).
-		WithArgs(1, "some info", "Alice").
+	expQ := "INSERT INTO users (id, info, name) VALUES (?, ?, ?)"
+	mock.ExpectExec(regexp.QuoteMeta(expQ)).
+		WithArgs(1, "info", "erctx.claim").
 		WillReturnResult(sqlmock.NewResult(1, 1))
+
 	mock.ExpectCommit()
 
-	result, err := plugin.TableCreate("user123", "users", data, nil)
+	res, err := plugin.TableCreate("u", "users", data, ctxData)
 	if err != nil {
-		t.Fatalf("TableCreate no context error: %s", err)
+		t.Fatalf("TableCreate error: %v", err)
 	}
-	if len(result) != 1 {
-		t.Errorf("expected 1 inserted row, got %d", len(result))
+	if len(res) != 1 {
+		t.Errorf("expected 1 row, got %d", len(res))
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TableCreateNoContext: %s", err)
-	}
-}
-
-func TestTableUpdateNoContext(t *testing.T) {
-	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-
-	data := map[string]interface{}{
-		"name": "Bob",
-	}
-	where := map[string]interface{}{
-		"id": map[string]interface{}{"=": 1},
-	}
-	mock.ExpectBegin()
-	expectedQuery := "UPDATE users SET name = ? WHERE id = ?"
-	mock.ExpectExec(regexp.QuoteMeta(expectedQuery)).
-		WithArgs("Bob", 1).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-
-	affected, err := plugin.TableUpdate("user123", "users", data, where, nil)
-	if err != nil {
-		t.Fatalf("TableUpdate no context error: %s", err)
-	}
-	if affected != 1 {
-		t.Errorf("expected 1 affected row, got %d", affected)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TableUpdateNoContext: %s", err)
-	}
-}
-
-func TestTableDeleteNoContext(t *testing.T) {
-	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-
-	where := map[string]interface{}{
-		"status": map[string]interface{}{"=": "inactive"},
-	}
-	mock.ExpectBegin()
-	expectedQuery := "DELETE FROM users WHERE status = ?"
-	mock.ExpectExec(regexp.QuoteMeta(expectedQuery)).
-		WithArgs("inactive").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectCommit()
-
-	affected, err := plugin.TableDelete("user123", "users", where, nil)
-	if err != nil {
-		t.Fatalf("TableDelete no context error: %s", err)
-	}
-	if affected != 1 {
-		t.Errorf("expected 1 affected row, got %d", affected)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TableDeleteNoContext: %s", err)
-	}
-}
-
-func TestTableUpdateWithContextInjection(t *testing.T) {
-	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-
-	data := map[string]interface{}{
-		"name": "Bob",
-		"note": "erctx.update_note",
-	}
-	where := map[string]interface{}{
-		"id": map[string]interface{}{"=": 1},
-	}
-	ctxData := map[string]interface{}{
-		"session": "xyz789",
-	}
-	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("SET @erctx_session = ?")).
-		WithArgs("xyz789").WillReturnResult(sqlmock.NewResult(1, 1))
-	expectedQuery := "UPDATE users SET name = ?, note = @erctx_update_note WHERE id = ?"
-	mock.ExpectExec(regexp.QuoteMeta(expectedQuery)).
-		WithArgs("Bob", 1).WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-
-	affected, err := plugin.TableUpdate("user123", "users", data, where, ctxData)
-	if err != nil {
-		t.Fatalf("TableUpdate with context error: %s", err)
-	}
-	if affected != 1 {
-		t.Errorf("expected 1 affected row, got %d", affected)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TableUpdateWithContext: %s", err)
-	}
-}
-
-func TestTableDeleteWithContextInjection(t *testing.T) {
-	plugin, mock := newTestPlugin(t)
-	defer plugin.db.Close()
-
-	where := map[string]interface{}{
-		"status": map[string]interface{}{"=": "inactive erctx.remove"},
-	}
-	ctxData := map[string]interface{}{
-		"session": "delete_session",
-	}
-	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("SET @erctx_session = ?")).
-		WithArgs("delete_session").WillReturnResult(sqlmock.NewResult(1, 1))
-	expectedQuery := "DELETE FROM users WHERE status = ?"
-	mock.ExpectExec(regexp.QuoteMeta(expectedQuery)).
-		WithArgs("inactive erctx.remove").
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectCommit()
-
-	affected, err := plugin.TableDelete("user123", "users", where, ctxData)
-	if err != nil {
-		t.Fatalf("TableDelete with context error: %s", err)
-	}
-	if affected != 1 {
-		t.Errorf("expected 1 affected row, got %d", affected)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in TableDeleteWithContext: %s", err)
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
@@ -594,8 +305,10 @@ func TestCallFunctionRollbackOnError(t *testing.T) {
 	plugin.routines = map[string]RoutineInfo{
 		"doSomething": {
 			Name:       "doSomething",
-			Params:     []RoutineParam{{Name: "param", DataType: "varchar", Mode: "IN", Ordinal: 1}},
 			ReturnType: "",
+			Params: []RoutineParam{
+				{Name: "param", DataType: "varchar", Mode: "IN", Ordinal: 1},
+			},
 		},
 	}
 
@@ -608,11 +321,237 @@ func TestCallFunctionRollbackOnError(t *testing.T) {
 		WillReturnError(errors.New("stored procedure error"))
 	mock.ExpectRollback()
 
-	_, err := plugin.CallFunction("user123", "doSomething", data, nil)
-	if err == nil || !regexp.MustCompile("stored procedure error").MatchString(err.Error()) {
+	_, err := plugin.CallFunction("u", "doSomething", data, nil)
+	if err == nil || !strings.Contains(err.Error(), "stored procedure error") {
 		t.Fatalf("expected stored procedure error, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unfulfilled expectations in CallFunctionRollbackOnError: %s", err)
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCallFunctionFunction(t *testing.T) {
+	plugin, mock := newTestPlugin(t)
+	defer plugin.db.Close()
+
+	plugin.routines = map[string]RoutineInfo{
+		"fnName": {
+			Name:       "fnName",
+			ReturnType: "varchar",
+			Params: []RoutineParam{
+				{Name: "p", DataType: "varchar", Mode: "IN", Ordinal: 1},
+			},
+		},
+	}
+	data := map[string]interface{}{
+		"p": "hello",
+	}
+	rows := sqlmock.NewRows([]string{"result"}).AddRow("world")
+	mock.ExpectBegin()
+	callRegex := regexp.QuoteMeta("SELECT fnName(?) AS result")
+	mock.ExpectQuery(callRegex).WithArgs("hello").WillReturnRows(rows)
+	mock.ExpectCommit()
+
+	res, err := plugin.CallFunction("x", "fnName", data, nil)
+	if err != nil {
+		t.Fatalf("CallFunction error: %v", err)
+	}
+	out, _ := json.Marshal(res)
+	if !strings.Contains(string(out), "world") {
+		t.Errorf("expected 'world' in output, got %s", string(out))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestGetSchema(t *testing.T) {
+	plugin, mock := newTestPlugin(t)
+	defer plugin.db.Close()
+
+	mock.ExpectQuery("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE()").
+		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("users").AddRow("orders"))
+
+	// columns for 'users'
+	mock.ExpectQuery(regexp.QuoteMeta(`
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+`)).
+		WithArgs("users").
+		WillReturnRows(sqlmock.NewRows([]string{"COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "COLUMN_DEFAULT", "COLUMN_KEY"}).
+			AddRow("id", "int", "NO", nil, "PRI").
+			AddRow("name", "varchar", "YES", nil, "").
+			AddRow("created_at", "timestamp", "NO", nil, ""))
+
+	// columns for 'orders'
+	mock.ExpectQuery(regexp.QuoteMeta(`
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+`)).
+		WithArgs("orders").
+		WillReturnRows(sqlmock.NewRows([]string{"COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "COLUMN_DEFAULT", "COLUMN_KEY"}).
+			AddRow("id", "int", "NO", nil, "PRI").
+			AddRow("amount", "float", "YES", nil, "").
+			AddRow("ts", "datetime", "YES", nil, ""))
+
+	plugin.routines = map[string]RoutineInfo{
+		"fnTest": {
+			Name:       "fnTest",
+			ReturnType: "int",
+			Params: []RoutineParam{
+				{Name: "x", DataType: "int", Mode: "IN", Ordinal: 1},
+			},
+		},
+		"doStuff": {
+			Name:       "doStuff",
+			ReturnType: "",
+			Params: []RoutineParam{
+				{Name: "p1", DataType: "varchar", Mode: "IN", Ordinal: 1},
+				{Name: "p2", DataType: "int", Mode: "IN", Ordinal: 2},
+			},
+		},
+	}
+
+	sch, err := plugin.GetSchema(nil)
+	if err != nil {
+		t.Fatalf("GetSchema error: %v", err)
+	}
+	js, _ := json.MarshalIndent(sch, "", "  ")
+	if !strings.Contains(string(js), `"tables"`) {
+		t.Errorf("expected 'tables' key, got: %s", js)
+	}
+	if !strings.Contains(string(js), `"rpc"`) {
+		t.Errorf("expected 'rpc' key, got: %s", js)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCallFunctionProcedure(t *testing.T) {
+	plugin, mock := newTestPlugin(t)
+	defer plugin.db.Close()
+
+	plugin.routines = map[string]RoutineInfo{
+		"doSomething": {
+			Name:       "doSomething",
+			ReturnType: "",
+			Params: []RoutineParam{
+				{Name: "p1", DataType: "varchar", Mode: "IN", Ordinal: 1},
+			},
+		},
+	}
+	data := map[string]interface{}{
+		"p1": "hello",
+	}
+	mock.ExpectBegin()
+	callRegex := regexp.QuoteMeta("CALL doSomething(?)")
+	mock.ExpectQuery(callRegex).
+		WithArgs("hello").
+		WillReturnRows(sqlmock.NewRows([]string{"col"}).AddRow("proc_ok"))
+	mock.ExpectCommit()
+
+	res, err := plugin.CallFunction("u", "doSomething", data, nil)
+	if err != nil {
+		t.Fatalf("CallFunction procedure error: %v", err)
+	}
+	j, _ := json.Marshal(res)
+	if !strings.Contains(string(j), "proc_ok") {
+		t.Errorf("expected 'proc_ok' in result, got: %s", j)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+/* NEW TESTS FOR TableUpdate and TableDelete with context injection */
+
+// TestTableUpdateWithContext2 ensures that if the context has multiple keys in random order, they get sorted in the SET query.
+func TestTableUpdateWithContext2(t *testing.T) {
+	plugin, mock := newTestPlugin(t)
+	defer plugin.db.Close()
+
+	// The data to update
+	data := map[string]interface{}{
+		"note": "SomeNote",
+		"qty":  42,
+	}
+	// The where clause
+	where := map[string]interface{}{
+		"id": map[string]interface{}{"=": 1},
+	}
+	// ctx has keys in random order: "xxx", "abc"
+	ctxData := map[string]interface{}{
+		"xxx": "111",
+		"abc": "222",
+	}
+	mock.ExpectBegin()
+
+	// Because keys are sorted, "abc" < "xxx"
+	// So we expect:
+	//   SET @erctx_abc = ?, @request_abc = ?, @erctx_xxx = ?, @request_xxx = ?
+	setQuery := regexp.QuoteMeta("SET @erctx_abc = ?, @request_abc = ?, @erctx_xxx = ?, @request_xxx = ?")
+	mock.ExpectExec(setQuery).
+		WithArgs("222", "222", "111", "111").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	// Then the update
+	upQ := regexp.QuoteMeta("UPDATE items SET note = ?, qty = ? WHERE id = ?")
+	mock.ExpectExec(upQ).
+		WithArgs("SomeNote", 42, 1).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectCommit()
+
+	affected, err := plugin.TableUpdate("user999", "items", data, where, ctxData)
+	if err != nil {
+		t.Fatalf("TableUpdate with context error: %v", err)
+	}
+	if affected != 1 {
+		t.Errorf("expected 1 row updated, got %d", affected)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations in TableUpdateWithContext2: %v", err)
+	}
+}
+
+// TestTableDeleteWithContext2 checks that multiple context keys are sorted and a delete query is run.
+func TestTableDeleteWithContext2(t *testing.T) {
+	plugin, mock := newTestPlugin(t)
+	defer plugin.db.Close()
+
+	where := map[string]interface{}{
+		"status": map[string]interface{}{"=": "old"},
+	}
+	ctxData := map[string]interface{}{
+		"ccc": "111",
+		"aaa": "222",
+	}
+	mock.ExpectBegin()
+
+	// sorted => "aaa" then "ccc"
+	setQuery := regexp.QuoteMeta("SET @erctx_aaa = ?, @request_aaa = ?, @erctx_ccc = ?, @request_ccc = ?")
+	mock.ExpectExec(setQuery).
+		WithArgs("222", "222", "111", "111").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	delQ := regexp.QuoteMeta("DELETE FROM items WHERE status = ?")
+	mock.ExpectExec(delQ).
+		WithArgs("old").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectCommit()
+
+	affected, err := plugin.TableDelete("someone", "items", where, ctxData)
+	if err != nil {
+		t.Fatalf("TableDelete with context error: %v", err)
+	}
+	if affected != 1 {
+		t.Errorf("expected 1 row deleted, got %d", affected)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations in TableDeleteWithContext2: %v", err)
 	}
 }

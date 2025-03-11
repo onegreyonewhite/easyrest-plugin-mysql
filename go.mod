@@ -6,7 +6,7 @@ require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/go-sql-driver/mysql v1.9.0
 	github.com/hashicorp/go-plugin v1.6.3
-	github.com/onegreyonewhite/easyrest v0.1.1
+	github.com/onegreyonewhite/easyrest v0.2.1
 )
 
 require (

@@ -109,7 +109,7 @@ export ER_DEFAULT_TIMEZONE="GMT"
 Clone the repository for the EasyREST MySQL Plugin and build the plugin binary. In the repository root, run:
 
 ```bash
-go build -o easyrest-plugin-mysql ./cmd/plugin-mysql
+go build -o easyrest-plugin-mysql mysql_plugin.go
 ```
 
 This produces the binary `easyrest-plugin-mysql` which must be in your PATH or referenced by the EasyREST server.
@@ -152,7 +152,7 @@ The server will detect the `ER_DB_MYSQL` environment variable and launch the MyS
    curl -X POST "http://localhost:8080/api/mysql/users/" \
      -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" \
-     -d '[{"name": "erctx.claims_sub"}]'
+     -d '[{"name": "erctx.claims_sub"},{"name": "request.claims.sub"}]'
    ```
 
    To call the stored procedure (or function):

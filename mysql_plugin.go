@@ -17,9 +17,9 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.1.1"
+var Version = "v0.2.0"
 
-// rowScanner interface defines the methods we need from a rows object.
+// rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
 	Columns() ([]string, error)
 	Next() bool
@@ -27,59 +27,71 @@ type rowScanner interface {
 	Err() error
 }
 
-// RoutineParam holds one parameter definition.
-type RoutineParam struct {
-	Name     string // name of the parameter
-	DataType string // e.g. INT, VARCHAR, etc.
-	Mode     string // IN, OUT, INOUT
-	Ordinal  int    // position in routine (0 for function return)
-}
-
-// RoutineInfo holds all parameter definitions for a routine.
-type RoutineInfo struct {
-	Name       string
-	Params     []RoutineParam // only IN and INOUT parameters (ordered by ORDINAL_POSITION, excluding ordinal 0)
-	ReturnType string         // if non-empty, the function's return type (from ordinal 0)
-}
-
-// mysqlPlugin implements the easyrest.DBPlugin interface for MySQL.
-type mysqlPlugin struct {
-	db       *sql.DB                // Connection pool for MySQL
-	routines map[string]RoutineInfo // Map of routine name to its info
-}
-
+// openDB is a package variable so we can override in tests (to return a sqlmock DB).
 var openDB = sql.Open
 
-// injectContext always sets session variables for the entire incoming context.
+// RoutineParam holds one parameter definition.
+type RoutineParam struct {
+	Name     string
+	DataType string
+	Mode     string
+	Ordinal  int
+}
+
+// RoutineInfo holds parameter definitions for a routine.
+type RoutineInfo struct {
+	Name       string
+	Params     []RoutineParam
+	ReturnType string
+}
+
+// mysqlPlugin implements easyrest.DBPlugin for MySQL.
+type mysqlPlugin struct {
+	db       *sql.DB
+	routines map[string]RoutineInfo
+}
+
+// injectContext sets *all* keys from ctx under two prefixes: erctx_ and request_.
 func (m *mysqlPlugin) injectContext(conn *sql.Conn, ctx map[string]interface{}) error {
 	if ctx == nil {
 		return nil
 	}
-	// Wrap the incoming context in a map under "erctx".
-	wrappedCtx := map[string]interface{}{"erctx": ctx}
-	flatCtx, err := easyrest.FormatToContext(wrappedCtx)
+	flatCtx, err := easyrest.FormatToContext(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to format context: %w", err)
 	}
 	if len(flatCtx) == 0 {
 		return nil
 	}
+
+	// Sort the flattened keys to guarantee a stable, deterministic order.
+	var sortedKeys []string
+	for k := range flatCtx {
+		sortedKeys = append(sortedKeys, k)
+	}
+	sort.Strings(sortedKeys)
+
 	var parts []string
 	var args []interface{}
-	// Build a SET command that assigns each flattened value to a session variable.
-	for k, v := range flatCtx {
-		parts = append(parts, fmt.Sprintf("@%s = ?", k))
-		args = append(args, v)
+	for _, k := range sortedKeys {
+		erctxKey := fmt.Sprintf("@erctx_%s = ?", k)
+		requestKey := fmt.Sprintf("@request_%s = ?", k)
+		parts = append(parts, erctxKey, requestKey)
+		val := flatCtx[k]
+		args = append(args, val, val)
+	}
+	if len(parts) == 0 {
+		return nil
 	}
 	setQuery := "SET " + strings.Join(parts, ", ")
 	_, err = conn.ExecContext(context.Background(), setQuery, args...)
 	if err != nil {
-		return fmt.Errorf("failed to execute SET command: %w", err)
+		return fmt.Errorf("failed to set session variables: %w", err)
 	}
 	return nil
 }
 
-// scanRows converts a rowScanner into a slice of map[string]interface{}.
+// scanRows reads row data from rowScanner into []map[string]interface{}.
 func scanRows(r rowScanner) ([]map[string]interface{}, error) {
 	cols, err := r.Columns()
 	if err != nil {
@@ -89,32 +101,34 @@ func scanRows(r rowScanner) ([]map[string]interface{}, error) {
 	var results []map[string]interface{}
 	for r.Next() {
 		columns := make([]interface{}, numCols)
-		columnPointers := make([]interface{}, numCols)
+		pointers := make([]interface{}, numCols)
 		for i := range columns {
-			columnPointers[i] = &columns[i]
+			pointers[i] = &columns[i]
 		}
-		if err := r.Scan(columnPointers...); err != nil {
+		if err := r.Scan(pointers...); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 		rowMap := make(map[string]interface{}, numCols)
 		for i, colName := range cols {
-			// Leave column names as-is.
-			if t, ok := columns[i].(time.Time); ok {
+			val := columns[i]
+			// handle time formatting
+			if t, ok := val.(time.Time); ok {
+				// midnight => date only
 				if t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0 {
 					rowMap[colName] = t.Format("2006-01-02")
 				} else {
 					rowMap[colName] = t.Format("2006-01-02 15:04:05")
 				}
-			} else if b, ok := columns[i].([]byte); ok {
+			} else if b, ok := val.([]byte); ok {
 				rowMap[colName] = string(b)
 			} else {
-				rowMap[colName] = columns[i]
+				rowMap[colName] = val
 			}
 		}
 		results = append(results, rowMap)
 	}
 	if err := r.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rows: %w", err)
+		return nil, fmt.Errorf("row iteration error: %w", err)
 	}
 	return results, nil
 }
@@ -129,7 +143,7 @@ func (m *mysqlPlugin) InitConnection(uri string) error {
 	dsn := strings.TrimPrefix(uri, "mysql://")
 	db, err := openDB("mysql", dsn)
 	if err != nil {
-		return fmt.Errorf("failed to open MySQL connection: %w", err)
+		return fmt.Errorf("failed to open MySQL: %w", err)
 	}
 	db.SetMaxOpenConns(50)
 	db.SetMaxIdleConns(10)
@@ -140,16 +154,15 @@ func (m *mysqlPlugin) InitConnection(uri string) error {
 	m.db = db
 	_, err = m.db.Exec("SET NAMES utf8mb4 COLLATE utf8mb4_general_ci")
 	if err != nil {
-		log.Fatal("Failed to set charset:", err)
+		log.Fatal("failed to set charset:", err)
 	}
-	// Load routine metadata.
 	if err := m.loadRoutines(); err != nil {
 		return fmt.Errorf("failed to load routines: %w", err)
 	}
 	return nil
 }
 
-// loadRoutines queries information_schema.parameters to load all routines in the current database.
+// loadRoutines populates m.routines from information_schema.parameters.
 func (m *mysqlPlugin) loadRoutines() error {
 	m.routines = make(map[string]RoutineInfo)
 	query := `
@@ -163,9 +176,9 @@ ORDER BY SPECIFIC_NAME, ORDINAL_POSITION;`
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var specificName, parameterName, dataType, parameterMode sql.NullString
+		var specificName, paramName, dataType, paramMode sql.NullString
 		var ordinal sql.NullInt64
-		if err := rows.Scan(&specificName, &parameterName, &dataType, &parameterMode, &ordinal); err != nil {
+		if err := rows.Scan(&specificName, &paramName, &dataType, &paramMode, &ordinal); err != nil {
 			return fmt.Errorf("failed to scan routine row: %w", err)
 		}
 		rName := specificName.String
@@ -177,16 +190,19 @@ ORDER BY SPECIFIC_NAME, ORDINAL_POSITION;`
 		if ordinal.Valid {
 			op = int(ordinal.Int64)
 		}
-		// If ordinal is 0, it's a function return value.
 		if op == 0 {
+			// function return
 			rInfo.ReturnType = dataType.String
 		} else {
-			// Append only IN or INOUT parameters (treat empty mode as IN).
-			if parameterMode.String == "IN" || parameterMode.String == "INOUT" || parameterMode.String == "" {
+			mode := paramMode.String
+			if mode == "" {
+				mode = "IN"
+			}
+			if mode == "IN" || mode == "INOUT" {
 				rInfo.Params = append(rInfo.Params, RoutineParam{
-					Name:     parameterName.String,
+					Name:     paramName.String,
 					DataType: dataType.String,
-					Mode:     parameterMode.String,
+					Mode:     mode,
 					Ordinal:  op,
 				})
 			}
@@ -196,45 +212,179 @@ ORDER BY SPECIFIC_NAME, ORDINAL_POSITION;`
 	return nil
 }
 
-// CallFunction calls a stored procedure (or function) with the provided data.
-// It validates that all required arguments are provided and replaces any value that starts with "erctx."
-// with the corresponding session variable reference. It also injects the entire context as session variables.
+// GetSchema returns a schema object with "tables" and "rpc".
+func (m *mysqlPlugin) GetSchema(ctx map[string]interface{}) (interface{}, error) {
+	tables, err := m.getTablesSchema()
+	if err != nil {
+		return nil, err
+	}
+	rpc, err := m.getRPCSchema()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"tables": tables,
+		"rpc":    rpc,
+	}, nil
+}
+
+// getTablesSchema enumerates tables and builds a swagger-ish schema for each.
+func (m *mysqlPlugin) getTablesSchema() (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+	rows, err := m.db.Query("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE()")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tables: %w", err)
+	}
+	defer rows.Close()
+	var tableNames []string
+	for rows.Next() {
+		var tn string
+		if err := rows.Scan(&tn); err != nil {
+			return nil, err
+		}
+		tableNames = append(tableNames, tn)
+	}
+	for _, tn := range tableNames {
+		sch, err := m.buildTableSchema(tn)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build schema for table %s: %w", tn, err)
+		}
+		result[tn] = sch
+	}
+	return result, nil
+}
+
+// buildTableSchema queries info_schema.columns to create a JSON schema for one table.
+func (m *mysqlPlugin) buildTableSchema(tableName string) (map[string]interface{}, error) {
+	query := `
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+`
+	rows, err := m.db.Query(query, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	properties := make(map[string]interface{})
+	var required []string
+	for rows.Next() {
+		var colName, dt, nullable, defv, ckey sql.NullString
+		if err := rows.Scan(&colName, &dt, &nullable, &defv, &ckey); err != nil {
+			return nil, err
+		}
+		propType := mapMySQLType(dt.String)
+		prop := map[string]interface{}{
+			"type": propType,
+		}
+		isPri := (strings.ToUpper(ckey.String) == "PRI")
+		if strings.ToUpper(nullable.String) == "YES" {
+			prop["x-nullable"] = true
+		}
+		if isPri {
+			// readOnly column => cannot be required
+			prop["readOnly"] = true
+		} else {
+			// if not primary key, check if we need to add to required
+			if strings.ToUpper(nullable.String) == "NO" && !defv.Valid {
+				required = append(required, colName.String)
+			}
+		}
+		properties[colName.String] = prop
+	}
+	schema := map[string]interface{}{
+		"type":       "object",
+		"properties": properties,
+	}
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	return schema, nil
+}
+
+// mapMySQLType returns swagger-ish type from MySQL data type.
+func mapMySQLType(dt string) string {
+	up := strings.ToUpper(dt)
+	if strings.Contains(up, "INT") {
+		return "integer"
+	}
+	if strings.Contains(up, "CHAR") || strings.Contains(up, "TEXT") {
+		return "string"
+	}
+	if strings.Contains(up, "BLOB") {
+		return "string"
+	}
+	if strings.Contains(up, "FLOAT") || strings.Contains(up, "DOUBLE") || strings.Contains(up, "DEC") || strings.Contains(up, "REAL") {
+		return "number"
+	}
+	return "string"
+}
+
+// getRPCSchema uses m.routines to produce routineName => [inputSchema, outputSchema].
+func (m *mysqlPlugin) getRPCSchema() (map[string]interface{}, error) {
+	rmap := make(map[string]interface{})
+	for name, info := range m.routines {
+		// build input schema
+		inProps := make(map[string]interface{})
+		var inReq []string
+		for _, param := range info.Params {
+			propType := mapMySQLType(param.DataType)
+			prop := map[string]interface{}{
+				"type": propType,
+			}
+			inProps[param.Name] = prop
+			inReq = append(inReq, param.Name)
+		}
+		inSchema := map[string]interface{}{
+			"type":       "object",
+			"properties": inProps,
+		}
+		if len(inReq) > 0 {
+			inSchema["required"] = inReq
+		}
+		// build output schema
+		outSchema := map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		}
+		if info.ReturnType != "" {
+			t := mapMySQLType(info.ReturnType)
+			outSchema["properties"] = map[string]interface{}{
+				"result": map[string]interface{}{
+					"type": t,
+				},
+			}
+		}
+		rmap[name] = []interface{}{inSchema, outSchema}
+	}
+	return rmap, nil
+}
+
+// CallFunction executes a stored procedure/function with final parameters.
 func (m *mysqlPlugin) CallFunction(userID, funcName string, data map[string]interface{}, ctx map[string]interface{}) (interface{}, error) {
 	rInfo, ok := m.routines[funcName]
 	if !ok {
 		return nil, fmt.Errorf("routine %s not found", funcName)
 	}
-	// Order parameters (only those with ORDINAL_POSITION > 0)
+	// sort by ordinal
 	sort.Slice(rInfo.Params, func(i, j int) bool {
 		return rInfo.Params[i].Ordinal < rInfo.Params[j].Ordinal
 	})
 	var placeholders []string
 	var callArgs []interface{}
 	for _, param := range rInfo.Params {
-		var found bool
-		var val interface{}
-		for k, v := range data {
-			if strings.EqualFold(k, param.Name) {
-				found = true
-				val = v
-				break
-			}
-		}
-		if !found {
+		placeholders = append(placeholders, "?")
+		val, exists := data[param.Name]
+		if !exists {
 			return nil, fmt.Errorf("missing required argument: %s", param.Name)
 		}
-		if s, ok := val.(string); ok && strings.HasPrefix(s, "erctx.") {
-			placeholders = append(placeholders, "@"+strings.Replace(s, "erctx.", "erctx_", 1))
-		} else {
-			placeholders = append(placeholders, "?")
-			callArgs = append(callArgs, val)
-		}
+		callArgs = append(callArgs, val)
 	}
-	// Check for extra arguments.
+	// check for unexpected args
 	for k := range data {
-		var found bool
-		for _, param := range rInfo.Params {
-			if strings.EqualFold(param.Name, k) {
+		found := false
+		for _, rp := range rInfo.Params {
+			if strings.EqualFold(rp.Name, k) {
 				found = true
 				break
 			}
@@ -245,14 +395,13 @@ func (m *mysqlPlugin) CallFunction(userID, funcName string, data map[string]inte
 	}
 	var callQuery string
 	if rInfo.ReturnType != "" {
-		// For functions, use SELECT syntax.
 		callQuery = fmt.Sprintf("SELECT %s(%s) AS result", funcName, strings.Join(placeholders, ", "))
 	} else {
 		callQuery = fmt.Sprintf("CALL %s(%s)", funcName, strings.Join(placeholders, ", "))
 	}
 	conn, err := m.db.Conn(context.Background())
 	if err != nil {
-		return nil, fmt.Errorf("failed to get DB connection: %w", err)
+		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
 	defer conn.Close()
 	if ctx != nil {
@@ -262,7 +411,7 @@ func (m *mysqlPlugin) CallFunction(userID, funcName string, data map[string]inte
 	}
 	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to begin tx: %w", err)
 	}
 	rows, err := tx.QueryContext(context.Background(), callQuery, callArgs...)
 	if err != nil {
@@ -276,13 +425,12 @@ func (m *mysqlPlugin) CallFunction(userID, funcName string, data map[string]inte
 		return nil, fmt.Errorf("failed to scan routine result: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit: %w", err)
 	}
 	return result, nil
 }
 
-// TableGet performs a SELECT query on the given table.
-// It always injects the entire context as session variables.
+// TableGet builds and executes a SELECT query.
 func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, where map[string]interface{},
 	ordering []string, groupBy []string, limit, offset int, ctx map[string]interface{}) ([]map[string]interface{}, error) {
 
@@ -293,7 +441,7 @@ func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, wher
 	query := fmt.Sprintf("SELECT %s FROM %s", fields, table)
 	whereClause, args, err := easyrest.BuildWhereClause(where)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build WHERE clause: %w", err)
+		return nil, fmt.Errorf("failed to build WHERE: %w", err)
 	}
 	query += whereClause
 	if len(groupBy) > 0 {
@@ -308,24 +456,17 @@ func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, wher
 	if offset > 0 {
 		query += fmt.Sprintf(" OFFSET %d", offset)
 	}
+	conn, err := m.db.Conn(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection: %w", err)
+	}
+	defer conn.Close()
 	if ctx != nil {
-		conn, err := m.db.Conn(context.Background())
-		if err != nil {
-			return nil, fmt.Errorf("failed to get DB connection: %w", err)
-		}
-		defer conn.Close()
 		if err := m.injectContext(conn, ctx); err != nil {
 			return nil, err
 		}
-		query = strings.ReplaceAll(query, "erctx.", "@erctx_")
-		rows, err := conn.QueryContext(context.Background(), query, args...)
-		if err != nil {
-			return nil, fmt.Errorf("failed to execute query: %w", err)
-		}
-		defer rows.Close()
-		return scanRows(rows)
 	}
-	rows, err := m.db.QueryContext(context.Background(), query, args...)
+	rows, err := conn.QueryContext(context.Background(), query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -333,17 +474,16 @@ func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, wher
 	return scanRows(rows)
 }
 
-// TableCreate performs an INSERT operation on the specified table.
-// It always injects the entire context as session variables and replaces any value starting with "erctx." with the corresponding session variable reference.
+// TableCreate builds and executes an INSERT statement from data.
 func (m *mysqlPlugin) TableCreate(userID, table string, data []map[string]interface{}, ctx map[string]interface{}) ([]map[string]interface{}, error) {
 	conn, err := m.db.Conn(context.Background())
 	if err != nil {
-		return nil, fmt.Errorf("failed to get DB connection: %w", err)
+		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
 	defer conn.Close()
 	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to begin tx: %w", err)
 	}
 	if ctx != nil {
 		if err := m.injectContext(conn, ctx); err != nil {
@@ -353,7 +493,8 @@ func (m *mysqlPlugin) TableCreate(userID, table string, data []map[string]interf
 	}
 	var results []map[string]interface{}
 	for _, row := range data {
-		var cols, placeholders []string
+		var cols []string
+		var placeholders []string
 		var args []interface{}
 		var keys []string
 		for k := range row {
@@ -362,38 +503,38 @@ func (m *mysqlPlugin) TableCreate(userID, table string, data []map[string]interf
 		sort.Strings(keys)
 		for _, k := range keys {
 			cols = append(cols, k)
-			if s, ok := row[k].(string); ok && strings.HasPrefix(s, "erctx.") {
-				placeholders = append(placeholders, "@"+strings.Replace(s, "erctx.", "erctx_", 1))
-			} else {
-				placeholders = append(placeholders, "?")
-				args = append(args, row[k])
-			}
+			placeholders = append(placeholders, "?")
+			args = append(args, row[k])
 		}
-		baseQuery := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-		baseQuery = strings.ReplaceAll(baseQuery, "erctx.", "@erctx_")
-		if _, err := tx.ExecContext(context.Background(), baseQuery, args...); err != nil {
+		insertQ := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+		if _, err := tx.ExecContext(context.Background(), insertQ, args...); err != nil {
 			tx.Rollback()
 			return nil, fmt.Errorf("failed to execute insert: %w", err)
 		}
 		results = append(results, row)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, fmt.Errorf("failed to commit: %w", err)
 	}
 	return results, nil
 }
 
-// TableUpdate performs an UPDATE operation on the specified table.
-// It always injects the entire context as session variables and replaces any value starting with "erctx." with the corresponding session variable reference.
+// TableUpdate builds and executes an UPDATE statement from data.
 func (m *mysqlPlugin) TableUpdate(userID, table string, data map[string]interface{}, where map[string]interface{}, ctx map[string]interface{}) (int, error) {
 	conn, err := m.db.Conn(context.Background())
 	if err != nil {
-		return 0, fmt.Errorf("failed to get DB connection: %w", err)
+		return 0, fmt.Errorf("failed to get connection: %w", err)
 	}
 	defer conn.Close()
 	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+		return 0, fmt.Errorf("failed to begin tx: %w", err)
+	}
+	if ctx != nil {
+		if err := m.injectContext(conn, ctx); err != nil {
+			tx.Rollback()
+			return 0, err
+		}
 	}
 	keys := make([]string, 0, len(data))
 	for k := range data {
@@ -403,29 +544,18 @@ func (m *mysqlPlugin) TableUpdate(userID, table string, data map[string]interfac
 	var setParts []string
 	var args []interface{}
 	for _, k := range keys {
-		if s, ok := data[k].(string); ok && strings.HasPrefix(s, "erctx.") {
-			setParts = append(setParts, fmt.Sprintf("%s = @%s", k, strings.Replace(s, "erctx.", "erctx_", 1)))
-		} else {
-			setParts = append(setParts, fmt.Sprintf("%s = ?", k))
-			args = append(args, data[k])
-		}
+		setParts = append(setParts, fmt.Sprintf("%s = ?", k))
+		args = append(args, data[k])
 	}
-	baseQuery := fmt.Sprintf("UPDATE %s SET %s", table, strings.Join(setParts, ", "))
+	updateQ := fmt.Sprintf("UPDATE %s SET %s", table, strings.Join(setParts, ", "))
 	whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
 	if err != nil {
 		tx.Rollback()
-		return 0, fmt.Errorf("failed to build WHERE clause: %w", err)
+		return 0, fmt.Errorf("failed to build WHERE: %w", err)
 	}
-	baseQuery += whereClause
+	updateQ += whereClause
 	args = append(args, whereArgs...)
-	if ctx != nil {
-		if err := m.injectContext(conn, ctx); err != nil {
-			tx.Rollback()
-			return 0, err
-		}
-		baseQuery = strings.ReplaceAll(baseQuery, "erctx.", "@erctx_")
-	}
-	res, err := tx.ExecContext(context.Background(), baseQuery, args...)
+	res, err := tx.ExecContext(context.Background(), updateQ, args...)
 	if err != nil {
 		tx.Rollback()
 		return 0, fmt.Errorf("failed to execute update: %w", err)
@@ -433,41 +563,38 @@ func (m *mysqlPlugin) TableUpdate(userID, table string, data map[string]interfac
 	affected, err := res.RowsAffected()
 	if err != nil {
 		tx.Rollback()
-		return 0, fmt.Errorf("failed to retrieve affected rows: %w", err)
+		return 0, fmt.Errorf("failed to get rowsAffected: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+		return 0, fmt.Errorf("failed to commit: %w", err)
 	}
 	return int(affected), nil
 }
 
-// TableDelete performs a DELETE operation on the specified table.
-// It always injects the entire context as session variables.
+// TableDelete builds and executes a DELETE statement.
 func (m *mysqlPlugin) TableDelete(userID, table string, where map[string]interface{}, ctx map[string]interface{}) (int, error) {
 	conn, err := m.db.Conn(context.Background())
 	if err != nil {
-		return 0, fmt.Errorf("failed to get DB connection: %w", err)
+		return 0, fmt.Errorf("failed to get connection: %w", err)
 	}
 	defer conn.Close()
 	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+		return 0, fmt.Errorf("failed to begin tx: %w", err)
 	}
-	whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
-	if err != nil {
-		tx.Rollback()
-		return 0, fmt.Errorf("failed to build WHERE clause: %w", err)
-	}
-	baseQuery := fmt.Sprintf("DELETE FROM %s%s", table, whereClause)
-	args := whereArgs
 	if ctx != nil {
 		if err := m.injectContext(conn, ctx); err != nil {
 			tx.Rollback()
 			return 0, err
 		}
-		baseQuery = strings.ReplaceAll(baseQuery, "erctx.", "@erctx_")
 	}
-	res, err := tx.ExecContext(context.Background(), baseQuery, args...)
+	whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
+	if err != nil {
+		tx.Rollback()
+		return 0, fmt.Errorf("failed to build WHERE: %w", err)
+	}
+	delQ := fmt.Sprintf("DELETE FROM %s%s", table, whereClause)
+	res, err := tx.ExecContext(context.Background(), delQ, whereArgs...)
 	if err != nil {
 		tx.Rollback()
 		return 0, fmt.Errorf("failed to execute delete: %w", err)
@@ -475,10 +602,10 @@ func (m *mysqlPlugin) TableDelete(userID, table string, where map[string]interfa
 	affected, err := res.RowsAffected()
 	if err != nil {
 		tx.Rollback()
-		return 0, fmt.Errorf("failed to retrieve affected rows: %w", err)
+		return 0, fmt.Errorf("failed to retrieve rowsAffected: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+		return 0, fmt.Errorf("failed to commit: %w", err)
 	}
 	return int(affected), nil
 }
