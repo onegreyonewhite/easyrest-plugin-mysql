@@ -369,8 +369,12 @@ func TestGetSchema(t *testing.T) {
 	plugin, mock := newTestPlugin(t)
 	defer plugin.db.Close()
 
-	mock.ExpectQuery("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE()").
-		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("users").AddRow("orders"))
+	// We'll return "users", "orders" (both BASE TABLE), and "v_myview" (VIEW).
+	mock.ExpectQuery("SELECT TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE()").
+		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME", "TABLE_TYPE"}).
+			AddRow("users", "BASE TABLE").
+			AddRow("orders", "BASE TABLE").
+			AddRow("v_myview", "VIEW"))
 
 	// columns for 'users'
 	mock.ExpectQuery(regexp.QuoteMeta(`
@@ -396,37 +400,35 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
 			AddRow("amount", "float", "YES", nil, "").
 			AddRow("ts", "datetime", "YES", nil, ""))
 
-	plugin.routines = map[string]RoutineInfo{
-		"fnTest": {
-			Name:       "fnTest",
-			ReturnType: "int",
-			Params: []RoutineParam{
-				{Name: "x", DataType: "int", Mode: "IN", Ordinal: 1},
-			},
-		},
-		"doStuff": {
-			Name:       "doStuff",
-			ReturnType: "",
-			Params: []RoutineParam{
-				{Name: "p1", DataType: "varchar", Mode: "IN", Ordinal: 1},
-				{Name: "p2", DataType: "int", Mode: "IN", Ordinal: 2},
-			},
-		},
-	}
+	// columns for 'v_myview' (the view)
+	mock.ExpectQuery(regexp.QuoteMeta(`
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+`)).
+		WithArgs("v_myview").
+		WillReturnRows(sqlmock.NewRows([]string{"COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "COLUMN_DEFAULT", "COLUMN_KEY"}).
+			AddRow("colA", "int", "NO", nil, "").
+			AddRow("colB", "varchar", "YES", nil, ""))
+
+	plugin.routines = map[string]RoutineInfo{} // no routines
 
 	sch, err := plugin.GetSchema(nil)
 	if err != nil {
 		t.Fatalf("GetSchema error: %v", err)
 	}
 	js, _ := json.MarshalIndent(sch, "", "  ")
-	if !strings.Contains(string(js), `"tables"`) {
-		t.Errorf("expected 'tables' key, got: %s", js)
+	if !strings.Contains(string(js), `"users"`) {
+		t.Errorf("expected 'users' schema, got: %s", js)
 	}
-	if !strings.Contains(string(js), `"rpc"`) {
-		t.Errorf("expected 'rpc' key, got: %s", js)
+	if !strings.Contains(string(js), `"orders"`) {
+		t.Errorf("expected 'orders' schema, got: %s", js)
+	}
+	if !strings.Contains(string(js), `"v_myview"`) {
+		t.Errorf("expected 'v_myview' schema, got: %s", js)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet expectations: %v", err)
+		t.Errorf("unmet expectations in TestGetSchema: %v", err)
 	}
 }
 
