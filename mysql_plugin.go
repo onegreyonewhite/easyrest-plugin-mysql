@@ -17,7 +17,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.2.0"
+var Version = "v0.2.1"
 
 // rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
@@ -83,6 +83,13 @@ func (m *mysqlPlugin) injectContext(conn *sql.Conn, ctx map[string]interface{}) 
 	if len(parts) == 0 {
 		return nil
 	}
+	if tzRaw, ok := ctx["timezone"]; ok {
+		if tzStr, ok2 := tzRaw.(string); ok2 && tzStr != "" {
+			parts = append(parts, "time_zone = ?")
+			args = append(args, tzStr)
+		}
+	}
+
 	setQuery := "SET " + strings.Join(parts, ", ")
 	_, err = conn.ExecContext(context.Background(), setQuery, args...)
 	if err != nil {

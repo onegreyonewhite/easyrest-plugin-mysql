@@ -111,9 +111,9 @@ func TestInjectContext(t *testing.T) {
 		"timezone": "UTC",
 	}
 
-	setQuery := regexp.QuoteMeta("SET @erctx_timezone = ?, @request_timezone = ?, @erctx_token = ?, @request_token = ?")
+	setQuery := regexp.QuoteMeta("SET @erctx_timezone = ?, @request_timezone = ?, @erctx_token = ?, @request_token = ?, time_zone = ?")
 	mock.ExpectExec(setQuery).
-		WithArgs("UTC", "UTC", "secret", "secret").
+		WithArgs("UTC", "UTC", "secret", "secret", "UTC").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	err = plugin.injectContext(conn, ctxData)
