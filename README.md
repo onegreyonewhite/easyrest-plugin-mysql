@@ -16,6 +16,7 @@ The **EasyREST MySQL Plugin** is an external plugin for [EasyREST](https://githu
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
+- [Performance Optimizations](#performance-optimizations)
 - [MySQL Setup using Docker](#mysql-setup-using-docker)
 - [SQL Schema and Stored Procedure](#sql-schema-and-stored-procedure)
 - [Environment Variables for EasyREST](#environment-variables-for-easyrest)
@@ -32,6 +33,41 @@ The **EasyREST MySQL Plugin** is an external plugin for [EasyREST](https://githu
 - [Go 1.23.6](https://golang.org/dl/) or later.
 - Basic knowledge of MySQL and Docker.
 
+## Performance Optimizations
+
+The plugin includes several performance optimizations:
+
+1. **Connection Pool Management:**
+   - Configurable maximum open connections (default: 100)
+   - Configurable idle connections (default: 20)
+   - Connection lifetime management
+   - Idle connection timeout
+
+2. **Bulk Operations:**
+   - Memory-efficient result handling
+   - Pre-allocated memory for large result sets
+   - Batch processing for large operations
+
+3. **Transaction Optimizations:**
+   - Automatic transaction management
+   - Configurable transaction timeouts
+   - Proper connection release
+
+4. **Query Parameters:**
+   - `maxOpenConns` - Maximum number of open connections (default: 100)
+   - `maxIdleConns` - Maximum number of idle connections (default: 20)
+   - `connMaxLifetime` - Connection reuse time in minutes (default: 5)
+   - `connMaxIdleTime` - Connection idle time in minutes (default: 10)
+   - `timeout` - Query timeout in seconds (default: 30)
+   - `bulkThreshold` - Number of rows threshold for batch operations (default: 100)
+   - `parseTime` - Parse MySQL TIME/TIMESTAMP/DATETIME as time.Time (recommended: true)
+
+Example URI with all optimization parameters:
+```bash
+export ER_DB_MYSQL="mysql://root:root@localhost:3307/easyrestdb?maxOpenConns=100&maxIdleConns=20&connMaxLifetime=5&connMaxIdleTime=10&timeout=30&bulkThreshold=100&parseTime=true"
+```
+
+
 ---
 
 ## MySQL Setup using Docker
@@ -47,7 +83,7 @@ docker run --name mysql-easyrest -p 3307:3306 \
 
 This command starts a MySQL 8 container:
 - **Container Name:** `mysql-easyrest`
-- **Host Port:** `3307` (mapped to MySQL’s default port 3306 in the container)
+- **Host Port:** `3307` (mapped to MySQL's default port 3306 in the container)
 - **Root Password:** `root`
 - **Database Created:** `easyrestdb`
 
@@ -92,7 +128,7 @@ docker exec -i mysql-easyrest mysql -uroot -proot easyrestdb < schema.sql
 Configure EasyREST to use this MySQL database via the MySQL plugin. Set the following environment variables before starting the EasyREST server:
 
 ```bash
-export ER_DB_MYSQL="mysql://root:root@tcp(localhost:3307)/easyrestdb?parseTime=true"
+export ER_DB_MYSQL="mysql://root:root@localhost:3307/easyrestdb?parseTime=true"
 export ER_TOKEN_SECRET="your-secret-key"
 export ER_TOKEN_USER_SEARCH="sub"
 export ER_DEFAULT_TIMEZONE="GMT"
