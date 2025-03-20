@@ -63,6 +63,7 @@ The plugin includes several performance optimizations:
    - `parseTime` - Parse MySQL TIME/TIMESTAMP/DATETIME as time.Time (recommended: true)
 
 Example URI with all optimization parameters:
+
 ```bash
 export ER_DB_MYSQL="mysql://root:root@localhost:3307/easyrestdb?maxOpenConns=100&maxIdleConns=20&connMaxLifetime=5&connMaxIdleTime=10&timeout=30&bulkThreshold=100&parseTime=true"
 ```
@@ -82,6 +83,7 @@ docker run --name mysql-easyrest -p 3307:3306 \
 ```
 
 This command starts a MySQL 8 container:
+
 - **Container Name:** `mysql-easyrest`
 - **Host Port:** `3307` (mapped to MySQL's default port 3306 in the container)
 - **Root Password:** `root`
@@ -181,7 +183,7 @@ The server will detect the `ER_DB_MYSQL` environment variable and launch the MyS
    ```bash
    curl -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/mysql/users/?select=id,name,created_at"
    ```
-   
+
    Create users (setup name from JWT-token `sub` claim):
 
    ```bash

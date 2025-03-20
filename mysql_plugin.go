@@ -17,13 +17,13 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.4.0"
+var Version = "v0.4.1"
 
 // rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
 	Columns() ([]string, error)
 	Next() bool
-	Scan(dest ...interface{}) error
+	Scan(dest ...any) error
 	Err() error
 }
 
@@ -53,7 +53,7 @@ type mysqlPlugin struct {
 }
 
 // injectContext sets *all* keys from ctx under two prefixes: erctx_ and request_.
-func (m *mysqlPlugin) injectContext(conn *sql.Conn, ctx map[string]interface{}) error {
+func (m *mysqlPlugin) injectContext(conn *sql.Conn, ctx map[string]any) error {
 	if ctx == nil {
 		return nil
 	}
@@ -75,8 +75,8 @@ func (m *mysqlPlugin) injectContext(conn *sql.Conn, ctx map[string]interface{}) 
 
 	var builder strings.Builder
 	builder.WriteString("SET ")
-	var args []interface{}
-	args = make([]interface{}, 0, len(flatCtx)*2+1) // +1 for possible timezone
+	var args []any
+	args = make([]any, 0, len(flatCtx)*2+1) // +1 for possible timezone
 
 	first := true
 	for _, k := range sortedKeys {
@@ -110,17 +110,17 @@ func (m *mysqlPlugin) injectContext(conn *sql.Conn, ctx map[string]interface{}) 
 	return nil
 }
 
-// scanRows converts row data into []map[string]interface{}.
+// scanRows converts row data into []map[string]any.
 // Pre-allocates memory for results with a capacity of 100 for better performance.
-func scanRows(r rowScanner) ([]map[string]interface{}, error) {
+func scanRows(r rowScanner) ([]map[string]any, error) {
 	cols, err := r.Columns()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get columns: %w", err)
 	}
 	numCols := len(cols)
-	results := make([]map[string]interface{}, 0, 100) // Pre-allocate memory for results
-	columns := make([]interface{}, numCols)
-	pointers := make([]interface{}, numCols)
+	results := make([]map[string]any, 0, 100) // Pre-allocate memory for results
+	columns := make([]any, numCols)
+	pointers := make([]any, numCols)
 	for i := range columns {
 		pointers[i] = &columns[i]
 	}
@@ -129,7 +129,7 @@ func scanRows(r rowScanner) ([]map[string]interface{}, error) {
 		if err := r.Scan(pointers...); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
-		rowMap := make(map[string]interface{}, numCols)
+		rowMap := make(map[string]any, numCols)
 		for i, colName := range cols {
 			val := columns[i]
 			if t, ok := val.(time.Time); ok {
@@ -331,7 +331,7 @@ ORDER BY SPECIFIC_NAME, ORDINAL_POSITION;`
 }
 
 // GetSchema enumerates tables + views and routines, building a swagger-ish schema.
-func (m *mysqlPlugin) GetSchema(ctx map[string]interface{}) (interface{}, error) {
+func (m *mysqlPlugin) GetSchema(ctx map[string]any) (any, error) {
 	tables, err := m.getTablesSchema()
 	if err != nil {
 		return nil, err
@@ -340,15 +340,15 @@ func (m *mysqlPlugin) GetSchema(ctx map[string]interface{}) (interface{}, error)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]interface{}{
+	return map[string]any{
 		"tables": tables,
 		"rpc":    rpc,
 	}, nil
 }
 
 // getTablesSchema enumerates both tables and views from INFORMATION_SCHEMA.TABLES.
-func (m *mysqlPlugin) getTablesSchema() (map[string]interface{}, error) {
-	result := make(map[string]interface{})
+func (m *mysqlPlugin) getTablesSchema() (map[string]any, error) {
+	result := make(map[string]any)
 	rows, err := m.db.Query(`
 SELECT TABLE_NAME, TABLE_TYPE 
 FROM INFORMATION_SCHEMA.TABLES 
@@ -382,7 +382,7 @@ WHERE TABLE_SCHEMA = DATABASE()
 }
 
 // buildTableSchema queries COLUMNS for the given table/view name.
-func (m *mysqlPlugin) buildTableSchema(tableName string) (map[string]interface{}, error) {
+func (m *mysqlPlugin) buildTableSchema(tableName string) (map[string]any, error) {
 	query := `
 SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY
 FROM INFORMATION_SCHEMA.COLUMNS
@@ -394,7 +394,7 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
 	}
 	defer rows.Close()
 
-	properties := make(map[string]interface{})
+	properties := make(map[string]any)
 	var required []string
 	for rows.Next() {
 		var colName, dt, nullable, defv, ckey sql.NullString
@@ -402,7 +402,7 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
 			return nil, err
 		}
 		colType := mapMySQLType(dt.String)
-		prop := map[string]interface{}{
+		prop := map[string]any{
 			"type": colType,
 		}
 		isPri := (strings.ToUpper(ckey.String) == "PRI")
@@ -419,7 +419,7 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
 		}
 		properties[colName.String] = prop
 	}
-	schema := map[string]interface{}{
+	schema := map[string]any{
 		"type":       "object",
 		"properties": properties,
 	}
@@ -448,45 +448,45 @@ func mapMySQLType(dt string) string {
 }
 
 // getRPCSchema uses m.routines to build routineName => [inSchema, outSchema].
-func (m *mysqlPlugin) getRPCSchema() (map[string]interface{}, error) {
-	rmap := make(map[string]interface{})
+func (m *mysqlPlugin) getRPCSchema() (map[string]any, error) {
+	rmap := make(map[string]any)
 	for name, info := range m.routines {
-		inProps := make(map[string]interface{})
+		inProps := make(map[string]any)
 		var inReq []string
 		for _, param := range info.Params {
 			propType := mapMySQLType(param.DataType)
-			prop := map[string]interface{}{
+			prop := map[string]any{
 				"type": propType,
 			}
 			inProps[param.Name] = prop
 			inReq = append(inReq, param.Name)
 		}
-		inSchema := map[string]interface{}{
+		inSchema := map[string]any{
 			"type":       "object",
 			"properties": inProps,
 		}
 		if len(inReq) > 0 {
 			inSchema["required"] = inReq
 		}
-		outSchema := map[string]interface{}{
+		outSchema := map[string]any{
 			"type":       "object",
-			"properties": map[string]interface{}{},
+			"properties": map[string]any{},
 		}
 		if info.ReturnType != "" {
 			t := mapMySQLType(info.ReturnType)
-			outSchema["properties"] = map[string]interface{}{
-				"result": map[string]interface{}{
+			outSchema["properties"] = map[string]any{
+				"result": map[string]any{
 					"type": t,
 				},
 			}
 		}
-		rmap[name] = []interface{}{inSchema, outSchema}
+		rmap[name] = []any{inSchema, outSchema}
 	}
 	return rmap, nil
 }
 
 // CallFunction executes a stored procedure/function with final parameters.
-func (m *mysqlPlugin) CallFunction(userID, funcName string, data map[string]interface{}, ctx map[string]interface{}) (interface{}, error) {
+func (m *mysqlPlugin) CallFunction(userID, funcName string, data map[string]any, ctx map[string]any) (any, error) {
 	rInfo, ok := m.routines[funcName]
 	if !ok {
 		return nil, fmt.Errorf("routine %s not found", funcName)
@@ -495,7 +495,7 @@ func (m *mysqlPlugin) CallFunction(userID, funcName string, data map[string]inte
 		return rInfo.Params[i].Ordinal < rInfo.Params[j].Ordinal
 	})
 	var placeholders []string
-	var callArgs []interface{}
+	var callArgs []any
 	for _, param := range rInfo.Params {
 		placeholders = append(placeholders, "?")
 		val, found := data[param.Name]
@@ -555,8 +555,8 @@ func (m *mysqlPlugin) CallFunction(userID, funcName string, data map[string]inte
 }
 
 // TableGet builds and executes a SELECT query.
-func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, where map[string]interface{},
-	ordering []string, groupBy []string, limit, offset int, ctx map[string]interface{}) ([]map[string]interface{}, error) {
+func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, where map[string]any,
+	ordering []string, groupBy []string, limit, offset int, ctx map[string]any) ([]map[string]any, error) {
 
 	fields := "*"
 	if len(selectFields) > 0 {
@@ -599,7 +599,7 @@ func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, wher
 }
 
 // TableCreate builds and executes an INSERT statement from data.
-func (m *mysqlPlugin) TableCreate(userID, table string, data []map[string]interface{}, ctx map[string]interface{}) ([]map[string]interface{}, error) {
+func (m *mysqlPlugin) TableCreate(userID, table string, data []map[string]any, ctx map[string]any) ([]map[string]any, error) {
 	conn, err := m.db.Conn(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
@@ -615,11 +615,11 @@ func (m *mysqlPlugin) TableCreate(userID, table string, data []map[string]interf
 			return nil, err
 		}
 	}
-	var results []map[string]interface{}
+	var results []map[string]any
 	for _, row := range data {
 		var cols []string
 		var placeholders []string
-		var args []interface{}
+		var args []any
 		var keys []string
 		for k := range row {
 			keys = append(keys, k)
@@ -644,7 +644,7 @@ func (m *mysqlPlugin) TableCreate(userID, table string, data []map[string]interf
 }
 
 // TableUpdate builds and executes an UPDATE statement.
-func (m *mysqlPlugin) TableUpdate(userID, table string, data map[string]interface{}, where map[string]interface{}, ctx map[string]interface{}) (int, error) {
+func (m *mysqlPlugin) TableUpdate(userID, table string, data map[string]any, where map[string]any, ctx map[string]any) (int, error) {
 	conn, err := m.db.Conn(context.Background())
 	if err != nil {
 		return 0, fmt.Errorf("failed to get connection: %w", err)
@@ -666,7 +666,7 @@ func (m *mysqlPlugin) TableUpdate(userID, table string, data map[string]interfac
 	}
 	sort.Strings(keys)
 	var setParts []string
-	var args []interface{}
+	var args []any
 	for _, k := range keys {
 		setParts = append(setParts, fmt.Sprintf("%s = ?", k))
 		args = append(args, data[k])
@@ -696,7 +696,7 @@ func (m *mysqlPlugin) TableUpdate(userID, table string, data map[string]interfac
 }
 
 // TableDelete builds and executes a DELETE statement.
-func (m *mysqlPlugin) TableDelete(userID, table string, where map[string]interface{}, ctx map[string]interface{}) (int, error) {
+func (m *mysqlPlugin) TableDelete(userID, table string, where map[string]any, ctx map[string]any) (int, error) {
 	conn, err := m.db.Conn(context.Background())
 	if err != nil {
 		return 0, fmt.Errorf("failed to get connection: %w", err)
