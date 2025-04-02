@@ -17,7 +17,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.4.1"
+var Version = "v0.4.2"
 
 // rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
