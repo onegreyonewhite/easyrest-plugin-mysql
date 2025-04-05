@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,7 +18,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.4.2"
+var Version = "v0.4.3"
 
 // rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
@@ -139,7 +140,16 @@ func scanRows(r rowScanner) ([]map[string]any, error) {
 					rowMap[colName] = t.Format("2006-01-02 15:04:05")
 				}
 			} else if b, ok := val.([]byte); ok {
-				rowMap[colName] = string(b)
+				// Attempt to unmarshal as JSON
+				var jsonData any
+				err := json.Unmarshal(b, &jsonData)
+				if err == nil {
+					// If successful, use the unmarshaled data
+					rowMap[colName] = jsonData
+				} else {
+					// If not JSON, treat as a regular string
+					rowMap[colName] = string(b)
+				}
 			} else {
 				rowMap[colName] = val
 			}

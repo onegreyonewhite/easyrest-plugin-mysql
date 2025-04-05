@@ -1,0 +1,22 @@
+token_user_search: sub
+check_scope: true
+cors:
+  enabled: true
+  allow_origin:
+    - "*"
+  methods:
+    - "GET"
+    - "POST"
+    - "PUT"
+    - "DELETE"
+    - "OPTIONS"
+  headers:
+    - "Accept"
+    - "Content-Type"
+    - "Authorization"
+    - "X-Requested-With"
+  max_age: 86400
+plugins:
+  test:
+    uri: mysql://root:root@localhost:3307/easyrestdb?parseTime=true
+    path: ./easyrest-plugin-mysql

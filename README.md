@@ -59,15 +59,21 @@ The plugin includes several performance optimizations:
    - `connMaxLifetime` - Connection reuse time in minutes (default: 5)
    - `connMaxIdleTime` - Connection idle time in minutes (default: 10)
    - `timeout` - Query timeout in seconds (default: 30)
-   - `bulkThreshold` - Number of rows threshold for batch operations (default: 100)
    - `parseTime` - Parse MySQL TIME/TIMESTAMP/DATETIME as time.Time (recommended: true)
 
 Example URI with all optimization parameters:
 
-```bash
-export ER_DB_MYSQL="mysql://root:root@localhost:3307/easyrestdb?maxOpenConns=100&maxIdleConns=20&connMaxLifetime=5&connMaxIdleTime=10&timeout=30&bulkThreshold=100&parseTime=true"
-```
-
+- **Via Environment Variable:**
+  ```bash
+  export ER_DB_MYSQL="mysql://root:root@localhost:3307/easyrestdb?maxOpenConns=100&maxIdleConns=20&connMaxLifetime=5&connMaxIdleTime=10&timeout=30&parseTime=true"
+  ```
+- **Via Configuration File:**
+  ```yaml
+  plugins:
+    mysql: # Or any name you choose for the plugin instance
+      uri: mysql://root:root@localhost:3307/easyrestdb?maxOpenConns=100&maxIdleConns=20&connMaxLifetime=5&connMaxIdleTime=10&timeout=30&parseTime=true
+      path: ./easyrest-plugin-mysql # Path to the plugin binary
+  ```
 
 ---
 
@@ -130,15 +136,27 @@ docker exec -i mysql-easyrest mysql -uroot -proot easyrestdb < schema.sql
 Configure EasyREST to use this MySQL database via the MySQL plugin. Set the following environment variables before starting the EasyREST server:
 
 ```bash
+# --- Database Connection ---
+# The URI for the MySQL database. The plugin will be selected when the URI scheme is 'mysql://'.
 export ER_DB_MYSQL="mysql://root:root@localhost:3307/easyrestdb?parseTime=true"
+
+# --- JWT Authentication ---
+# Secret for HS* algorithms OR path to public key file for RS*/ES*/PS* algorithms
 export ER_TOKEN_SECRET="your-secret-key"
+# export ER_TOKEN_PUBLIC_KEY="/path/to/public.key"
+
+# Claim in the JWT token to use as the user identifier
 export ER_TOKEN_USER_SEARCH="sub"
+
+# --- General Settings ---
+# Default timezone for context propagation.
 export ER_DEFAULT_TIMEZONE="GMT"
+
+# Optional: Enable/disable scope checking (default: true if token secret/key is set)
+# export ER_CHECK_SCOPE="true"
 ```
 
-- **ER_DB_MYSQL:** The URI for the MySQL database. The plugin will be selected when the URI scheme is `mysql://`.
-- **ER_TOKEN_SECRET & ER_TOKEN_USER_SEARCH:** Used by EasyREST for JWT authentication.
-- **ER_DEFAULT_TIMEZONE:** Default timezone for context propagation.
+**Note:** If both a configuration file and environment variables are present, the configuration file settings take precedence for overlapping parameters. The `path` for the plugin can only be set via the configuration file.
 
 ---
 
@@ -156,13 +174,37 @@ This produces the binary `easyrest-plugin-mysql` which must be in your PATH or r
 
 ## Running EasyREST Server with the Plugin
 
-Download and install the pre-built binary for the EasyREST Server from the [EasyREST Releases](https://github.com/onegreyonewhite/easyrest/releases) page. Once installed, set the environment variables (as above) and run the server binary:
+Download and install the pre-built binary for the EasyREST Server from the [EasyREST Releases](https://github.com/onegreyonewhite/easyrest/releases) page. Once installed, ensure the configuration is set up (either via `config.yaml` or environment variables) and run the server binary.
 
-```bash
-./easyrest-server
-```
+**Using a Configuration File (Recommended):**
 
-The server will detect the `ER_DB_MYSQL` environment variable and launch the MySQL plugin via RPC.
+1. **Create the `config.yaml` file:** Save the configuration example above (or your customized version) as `config.yaml` (or any name you prefer).
+2. **Place the plugin binary:** Ensure the compiled `easyrest-plugin-mysql` binary exists at the location specified in the `path` field within `config.yaml` (e.g., in the same directory as the `easyrest-server` binary if `path: ./easyrest-plugin-mysql` is used).
+3. **Run the server:** Execute the EasyREST server binary, pointing it to your configuration file using the `--config` flag:
+
+    ```bash
+    ./easyrest-server --config config.yaml
+    ```
+
+    *   The server reads `config.yaml`.
+    *   It finds the `plugins.mysql` section.
+    *   It sees the `mysql://` scheme in the `uri` and knows to use a MySQL plugin.
+    *   It uses the `path` field (`./easyrest-plugin-mysql`) to locate and execute the plugin binary.
+    *   The server then communicates with the plugin via RPC to handle requests to `/api/mysql/...`.
+
+**Using Environment Variables:**
+
+1. **Set Environment Variables:** Define the necessary `ER_` variables as shown previously.
+2. **Place the plugin binary:** The `easyrest-plugin-mysql` binary *must* be located either in the same directory as the `easyrest-server` binary or in a directory included in your system's `PATH` environment variable.
+3. **Run the server:**
+    ```bash
+    ./easyrest-server
+    ```
+    *   The server detects `ER_DB_MYSQL` starting with `mysql://`.
+    *   It searches for an executable named `easyrest-plugin-mysql` in the current directory and in the system `PATH`.
+    *   If found, it executes the plugin binary and communicates via RPC.
+
+    **Limitation:** You cannot specify a custom path or name for the plugin binary when using only environment variables.
 
 ---
 
@@ -178,24 +220,19 @@ The server will detect the `ER_DB_MYSQL` environment variable and launch the MyS
 
 2. **Calling the API:**
 
-   With the server running, you can test the endpoints. For example, to fetch users:
+   With the server running, you can test the endpoints. The API path depends on the name you gave the plugin instance in your `config.yaml` (e.g., `mysql`) or defaults to `mysql` if using `ER_DB_MYSQL`. Assuming the name is `mysql`:
 
    ```bash
+   # Fetch users
    curl -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/mysql/users/?select=id,name,created_at"
-   ```
 
-   Create users (setup name from JWT-token `sub` claim):
-
-   ```bash
+   # Create users (setup name from JWT-token 'sub' claim)
    curl -X POST "http://localhost:8080/api/mysql/users/" \
      -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" \
      -d '[{"name": "erctx.claims_sub"},{"name": "request.claims.sub"}]'
-   ```
 
-   To call the stored procedure (or function):
-
-   ```bash
+   # Call the stored procedure (or function)
    curl -X POST "http://localhost:8080/api/mysql/rpc/doSomething/" \
      -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" \
