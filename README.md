@@ -23,6 +23,7 @@ The **EasyREST MySQL Plugin** is an external plugin for [EasyREST](https://githu
 - [Building the Plugin](#building-the-plugin)
 - [Running EasyREST Server with the Plugin](#running-easyrest-server-with-the-plugin)
 - [Testing API Endpoints](#testing-api-endpoints)
+- [Working with Tables, Views, and Context Variables](#working-with-tables-views-and-context-variables)
 - [License](#license)
 
 ---
@@ -238,6 +239,176 @@ Download and install the pre-built binary for the EasyREST Server from the [Easy
      -H "Content-Type: application/json" \
      -d '{"jsonParam": "test"}'
    ```
+
+---
+
+## Working with Tables, Views, and Context Variables
+
+This plugin allows you to interact with your MySQL database tables and views directly through the EasyREST API. It also provides a powerful mechanism for injecting context from the incoming request (like user information from a JWT) directly into your SQL session.
+
+### Interacting with Tables and Views
+
+Once the plugin is configured and connected to your database, EasyREST exposes API endpoints for your tables and views under the path `/api/{plugin_name}/{table_or_view_name}/` (e.g., `/api/mysql/users/`).
+
+-   **Read (SELECT):** Use `GET` requests. You can specify fields (`?select=col1,col2`), filters (`?where=...`), ordering (`?orderBy=...`), grouping (`?groupBy=...`), limit (`?limit=...`), and offset (`?offset=...`). Views are accessible via `GET` just like tables.
+-   **Create (INSERT):** Use `POST` requests with a JSON array of objects in the request body.
+-   **Update (UPDATE):** Use `PATCH` requests. Provide the data to update in the request body and specify the rows to update using `?where=...` query parameters.
+-   **Delete (DELETE):** Use `DELETE` requests, specifying rows to delete using `?where=...` query parameters.
+
+Refer back to the [Testing API Endpoints](#testing-api-endpoints) section for basic `curl` examples.
+
+### Schema Introspection and Type Mapping
+
+The plugin automatically introspects your database schema (tables and views) and makes it available via the `/api/{plugin_name}/schema` endpoint. This schema reflects the columns and their basic types.
+
+**Example Table Creation:**
+
+```sql
+-- Example table definition
+CREATE TABLE IF NOT EXISTS products (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  sku VARCHAR(50) NOT NULL UNIQUE,
+  name VARCHAR(255) NOT NULL,
+  description TEXT NULL,
+  price DECIMAL(10, 2) DEFAULT 0.00,
+  stock_count INT DEFAULT 0,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_by VARCHAR(100), -- Could store user ID/sub
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
+When the plugin reads this schema, it maps MySQL data types to simpler, JSON-friendly types:
+
+| MySQL Data Type Category        | Example Types                               | Schema Type | Notes                                    |
+| :------------------------------ | :------------------------------------------ | :---------- | :--------------------------------------- |
+| Integer Types                   | `INT`, `TINYINT`, `BIGINT`                  | `integer`   |                                          |
+| Fixed-Point / Floating-Point  | `DECIMAL`, `NUMERIC`, `FLOAT`, `DOUBLE`     | `number`    |                                          |
+| String Types                    | `VARCHAR`, `CHAR`, `TEXT`, `ENUM`, `JSON`   | `string`    |                                          |
+| Binary Types                    | `BLOB`, `BINARY`, `VARBINARY`               | `string`    | Returned as base64 or hex string usually |
+| Date/Time Types                 | `DATE`, `DATETIME`, `TIMESTAMP`, `TIME`     | `string`    | Formatted as string (e.g., `YYYY-MM-DD`) |
+| Boolean                         | `BOOLEAN`, `BOOL` (`TINYINT(1)`)            | `integer`   | Typically represented as 0 or 1          |
+
+The `schema` endpoint also indicates which fields are nullable (`x-nullable: true`) and which are part of the primary key (`readOnly: true`, implying they aren't required in inserts/updates via the API if auto-generated).
+
+### Using Context Variables (`erctx.` / `request.`)
+
+A key feature is the ability to use data from the EasyREST request context within your SQL queries without explicitly passing it in every API call's `where` clause or body. This is done using special prefixes in your API request data:
+
+-   `erctx.<path>`: Accesses data from the general EasyREST context (like JWT claims).
+-   `request.<path>`: Accesses data specific to the current request (often overlaps with `erctx`).
+
+**How it Works:**
+
+1.  **API Request:** You send a request, potentially including these special values:
+    ```bash
+    # Example: Create a product, setting created_by from JWT's 'sub' claim
+    curl -X POST "http://localhost:8080/api/mysql/products/" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '[{"sku": "PROD001", "name": "My Product", "created_by": "erctx.claims_sub"}]'
+    ```
+2.  **Plugin Injection:** Before executing the main SQL query (INSERT, SELECT, UPDATE, DELETE, or CALL), the plugin takes *all* available context variables, flattens their keys (e.g., `claims.sub` becomes `claims_sub`), and sets them as MySQL session variables using `SET @erctx_<key> = ?, @request_<key> = ?`. For the example above, it would effectively run:
+    ```sql
+    SET @erctx_claims_sub = 'user123', @request_claims_sub = 'user123', /* ... other context vars ... */ ;
+    ```
+    *(Assuming the JWT `sub` claim was `user123`)*
+3.  **SQL Execution:** Your main SQL query (or trigger, or view logic) can now reference these session variables (e.g., `@request_claims_sub`). These variables exist only for the duration of the connection used for that specific API request.
+
+This is extremely useful for:
+
+-   **Audit Trails:** Automatically recording which user created or modified a row.
+-   **Row-Level Security:** Filtering data based on the user making the request within views or triggers.
+-   **Multi-Tenancy:** Scoping queries to a specific tenant ID derived from the user's context.
+
+### Examples in SQL
+
+Here are conceptual examples of how to leverage session variables set from the context:
+
+**1. Trigger for Ownership/Validation:**
+
+Imagine you want to ensure only the user who created a product (stored in `created_by`) can update its `name` or `description`.
+
+```sql
+DELIMITER //
+
+CREATE TRIGGER before_product_update
+BEFORE UPDATE ON products
+FOR EACH ROW
+BEGIN
+    -- Check if the user making the request (@request_claims_sub)
+    -- is the one who created the product.
+    -- Allow update only if they match OR if the user is an admin (e.g., from a role claim)
+    IF OLD.created_by != @request_claims_sub AND @request_claims_role != 'admin' THEN
+        -- If trying to update restricted fields
+        IF NEW.name != OLD.name OR NEW.description != OLD.description THEN
+             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Authorization failed: You can only modify products you created.';
+        END IF;
+    END IF;
+END;
+//
+
+DELIMITER ;
+```
+*Note: This assumes your JWT contains a `sub` claim (mapped to `@request_claims_sub`) and potentially a `role` claim (mapped to `@request_claims_role`). You need `token_user_search: sub` in your EasyREST config.*
+
+**2. Stored Function for User-Specific Data (Alternative to View):**
+
+**Important Note:** MySQL **does not allow** the direct use of session variables (like `@request_claims_sub`) within a `CREATE VIEW` statement. Attempting to do so will result in `ERROR 1351 (HY000)`. Views must have static definitions.
+
+To achieve row-level security based on the current user context, use a **Stored Function** instead. This function *can* access session variables set by the plugin.
+
+Create a function that returns products filtered by the `created_by` field matching the current user's `sub` claim.
+
+```sql
+DELIMITER //
+
+CREATE FUNCTION getMyProducts()
+RETURNS JSON
+DETERMINISTIC
+READS SQL DATA -- Important: Indicates the function reads data
+BEGIN
+    DECLARE result JSON;
+    SELECT JSON_ARRAYAGG(JSON_OBJECT(
+            'id', id,
+            'sku', sku,
+            'name', name,
+            'price', price,
+            'stock_count', stock_count,
+            'is_active', is_active,
+            'created_at', created_at
+           ))
+    INTO result
+    FROM products
+    WHERE created_by = @request_claims_sub; -- Session variable works here!
+
+    RETURN COALESCE(result, JSON_ARRAY()); -- Return empty array if no results
+END;
+//
+
+DELIMITER ;
+```
+
+Now, you can call this function using the EasyREST RPC endpoint:
+
+```bash
+# Call the function to get products for the current user
+curl -X POST "http://localhost:8080/api/mysql/rpc/getMyProducts/" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' # No parameters needed for this function
+```
+
+The plugin will inject the context (setting `@request_claims_sub`), call the `getMyProducts()` function, and return the JSON array of products belonging to the user.
+
+**Alternative: Application-Level Filtering:**
+You can always achieve the same result by requiring the client to specify the filter in the `GET` request:
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+"http://localhost:8080/api/mysql/products/?select=id,sku,name&where=created_by%3Derctx.claims_sub"
+```
+This uses the `erctx.claims_sub` directly in the `where` parameter, which the plugin resolves before executing the `SELECT` query.
 
 ---
 
