@@ -18,7 +18,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.4.3"
+var Version = "v0.5.0"
 
 // rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
@@ -186,6 +186,8 @@ func (m *mysqlPlugin) InitConnection(uri string) error {
 	connMaxLifetime := 5
 	connMaxIdleTime := 10
 	timeout := 30 // Timeout in seconds
+
+	queryParams.Del("autoCleanup")
 
 	// Remove connection parameters from query before creating DSN
 	if val := queryParams.Get("maxOpenConns"); val != "" {
@@ -744,6 +746,121 @@ func (m *mysqlPlugin) TableDelete(userID, table string, where map[string]any, ct
 	return int(affected), nil
 }
 
+// mysqlCachePlugin implements the CachePlugin interface using MySQL.
+type mysqlCachePlugin struct {
+	dbPluginPointer *mysqlPlugin
+}
+
+// InitConnection ensures the cache table exists and starts the cleanup goroutine.
+// It relies on the underlying mysqlPlugin's InitConnection being called first or concurrently
+// by the plugin framework to establish the database connection.
+func (p *mysqlCachePlugin) InitConnection(uri string) error {
+	// Parse the URI to extract query parameters
+	parsedURL, err := url.Parse(uri)
+	if err != nil {
+		return fmt.Errorf("failed to parse URI: %w", err)
+	}
+
+	// Get the autoCleanup query parameter
+	autoCleanup := parsedURL.Query().Get("autoCleanup")
+
+	// Remove the autoCleanup parameter from the URI
+	query := parsedURL.Query()
+	query.Del("autoCleanup")
+	parsedURL.RawQuery = query.Encode()
+	uri = parsedURL.String()
+
+	// Ensure the underlying DB connection is initialized.
+	if p.dbPluginPointer.db == nil {
+		// Attempt to initialize the main plugin connection if not already done.
+		err := p.dbPluginPointer.InitConnection(uri)
+		if err != nil {
+			return fmt.Errorf("failed to initialize underlying db connection for cache: %w", err)
+		}
+	}
+
+	// Check again after potential initialization.
+	if p.dbPluginPointer.db == nil {
+		return errors.New("database connection not available for cache plugin")
+	}
+
+	// Create cache table if it doesn't exist
+	// Use DATETIME for expires_at in MySQL
+	createTableSQL := "CREATE TABLE IF NOT EXISTS easyrest_cache (`key` VARCHAR(255) PRIMARY KEY, value TEXT, expires_at DATETIME)"
+
+	// Use a background context as table creation is an initialization step.
+	_, err = p.dbPluginPointer.db.ExecContext(context.Background(), createTableSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create cache table: %w", err)
+	}
+
+	// Launch background goroutine for cleanup if autoCleanup is set
+	if autoCleanup == "1" || autoCleanup == "true" {
+		go p.cleanupExpiredCacheEntries()
+	}
+
+	return nil
+}
+
+// cleanupExpiredCacheEntries periodically deletes expired cache entries.
+func (p *mysqlCachePlugin) cleanupExpiredCacheEntries() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if p.dbPluginPointer.db == nil {
+			fmt.Printf("Error cleaning cache: DB connection is nil\n") // Use fmt.Printf for logging in plugins
+			continue                                                   // Skip this cycle
+		}
+		// Use NOW() for current time in MySQL
+		// Use background context for cleanup task.
+		_, err := p.dbPluginPointer.db.ExecContext(context.Background(), "DELETE FROM easyrest_cache WHERE expires_at <= NOW()")
+		if err != nil {
+			// Log the error, but continue running the cleanup
+			fmt.Printf("Error cleaning up expired cache entries: %v\n", err) // Use fmt.Printf
+		}
+	}
+}
+
+// Set stores a key-value pair with a TTL in the cache.
+func (p *mysqlCachePlugin) Set(key string, value string, ttl time.Duration) error {
+	if p.dbPluginPointer.db == nil {
+		return errors.New("database connection not available for cache set")
+	}
+	// Calculate expiration time
+	expiresAt := time.Now().Add(ttl)
+	// MySQL uses INSERT ... ON DUPLICATE KEY UPDATE - Use interpreted string
+	query := "INSERT INTO easyrest_cache (`key`, value, expires_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value), expires_at = VALUES(expires_at)"
+
+	// Use background context for simple cache operation.
+	_, err := p.dbPluginPointer.db.ExecContext(context.Background(), query, key, value, expiresAt)
+	if err != nil {
+		return fmt.Errorf("failed to set cache entry: %w", err)
+	}
+	return nil
+}
+
+// Get retrieves a value from the cache if it exists and hasn't expired.
+func (p *mysqlCachePlugin) Get(key string) (string, error) {
+	if p.dbPluginPointer.db == nil {
+		return "", errors.New("database connection not available for cache get")
+	}
+	var value string
+	// MySQL uses NOW() for current time comparison - Use interpreted string
+	query := "SELECT value FROM easyrest_cache WHERE `key` = ? AND expires_at > NOW()"
+
+	// Use background context for simple cache operation.
+	err := p.dbPluginPointer.db.QueryRowContext(context.Background(), query, key).Scan(&value)
+	if err != nil {
+		// Return standard sql.ErrNoRows if not found or expired, otherwise the specific error
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", sql.ErrNoRows // Standard way to signal cache miss
+		}
+		return "", fmt.Errorf("failed to get cache entry: %w", err)
+	}
+	return value, nil
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
@@ -752,10 +869,14 @@ func main() {
 		return
 	}
 	impl := &mysqlPlugin{}
+	// Create the cache plugin instance, pointing to the core plugin instance
+	cacheImpl := &mysqlCachePlugin{dbPluginPointer: impl}
+
 	hplugin.Serve(&hplugin.ServeConfig{
 		HandshakeConfig: easyrest.Handshake,
 		Plugins: map[string]hplugin.Plugin{
-			"db": &easyrest.DBPluginPlugin{Impl: impl},
+			"db":    &easyrest.DBPluginPlugin{Impl: impl},
+			"cache": &easyrest.CachePluginPlugin{Impl: cacheImpl}, // Register cache plugin
 		},
 	})
 }

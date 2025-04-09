@@ -18,5 +18,6 @@ cors:
   max_age: 86400
 plugins:
   test:
-    uri: mysql://root:root@localhost:3307/easyrestdb?parseTime=true
+    uri: mysql://root:root@localhost:3307/easyrestdb?parseTime=true&autoCleanup=true
     path: ./easyrest-plugin-mysql
+    enable_cache: true

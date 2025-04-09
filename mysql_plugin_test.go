@@ -557,3 +557,210 @@ func TestTableDeleteWithContext2(t *testing.T) {
 		t.Errorf("unmet expectations in TableDeleteWithContext2: %v", err)
 	}
 }
+
+/* -- Tests for mysqlCachePlugin -- */
+
+// Helper to create a test cache plugin instance
+func newTestCachePlugin(t *testing.T) (*mysqlCachePlugin, *mysqlPlugin, sqlmock.Sqlmock) {
+	corePlugin, mock := newTestPlugin(t)
+	cachePlugin := &mysqlCachePlugin{dbPluginPointer: corePlugin}
+	return cachePlugin, corePlugin, mock
+}
+
+func TestCacheInitConnection(t *testing.T) {
+	cachePlugin, _, mock := newTestCachePlugin(t)
+
+	// Expect CREATE TABLE IF NOT EXISTS
+	createSQL := "CREATE TABLE IF NOT EXISTS easyrest_cache (`key` VARCHAR(255) PRIMARY KEY, value TEXT, expires_at DATETIME)"
+	mock.ExpectExec(regexp.QuoteMeta(createSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
+
+	// Call InitConnection (assuming underlying DB init succeeded)
+	// We test with autoCleanup=true, but cannot easily verify goroutine start in unit test
+	err := cachePlugin.InitConnection("mysql://mock?autoCleanup=true")
+	if err != nil {
+		t.Fatalf("CacheInitConnection failed: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCacheInitConnectionTableCreateError(t *testing.T) {
+	cachePlugin, _, mock := newTestCachePlugin(t)
+
+	// Expect CREATE TABLE IF NOT EXISTS to fail
+	createSQL := "CREATE TABLE IF NOT EXISTS easyrest_cache (`key` VARCHAR(255) PRIMARY KEY, value TEXT, expires_at DATETIME)"
+	mock.ExpectExec(regexp.QuoteMeta(createSQL)).WillReturnError(errors.New("table create failed"))
+
+	err := cachePlugin.InitConnection("mysql://mock")
+	if err == nil || !strings.Contains(err.Error(), "failed to create cache table") {
+		t.Fatalf("Expected table creation error, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCacheInitConnectionNoDB(t *testing.T) {
+	cachePlugin, corePlugin, mock := newTestCachePlugin(t)
+	corePlugin.db = nil // Start with underlying DB as nil to trigger internal init
+
+	// Expect the internal call to corePlugin.InitConnection to happen and fail (e.g., at ping)
+	// Note: openDB mock is part of newTestPlugin setup and returns the mock db
+	mock.ExpectPing().WillReturnError(errors.New("mock ping failed"))
+
+	// Call CacheInitConnection, which should internally call corePlugin.InitConnection
+	err := cachePlugin.InitConnection("mysql://mock")
+
+	// Assert that the error is the one from the failed underlying initialization
+	if err == nil || !strings.Contains(err.Error(), "failed to initialize underlying db connection") || !strings.Contains(err.Error(), "mock ping failed") {
+		t.Fatalf("Expected underlying DB init failure error, got: %v", err)
+	}
+
+	// Ensure all expected calls (just the ping in this case) were met
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCacheSet(t *testing.T) {
+	cachePlugin, _, mock := newTestCachePlugin(t)
+	key := "mykey"
+	value := "myvalue"
+	ttl := 5 * time.Minute
+
+	// Expect INSERT ... ON DUPLICATE KEY UPDATE
+	setSQL := "INSERT INTO easyrest_cache (`key`, value, expires_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value), expires_at = VALUES(expires_at)"
+	// We don't check exact expiresAt due to potential slight time differences
+	mock.ExpectExec(regexp.QuoteMeta(setSQL)).
+		WithArgs(key, value, sqlmock.AnyArg()). // Check key and value, ignore exact time
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	err := cachePlugin.Set(key, value, ttl)
+	if err != nil {
+		t.Fatalf("CacheSet failed: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCacheSetDBError(t *testing.T) {
+	cachePlugin, _, mock := newTestCachePlugin(t)
+	key := "mykey"
+	value := "myvalue"
+	ttl := 5 * time.Minute
+
+	setSQL := "INSERT INTO easyrest_cache (`key`, value, expires_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value), expires_at = VALUES(expires_at)"
+	mock.ExpectExec(regexp.QuoteMeta(setSQL)).
+		WithArgs(key, value, sqlmock.AnyArg()).
+		WillReturnError(errors.New("DB write error"))
+
+	err := cachePlugin.Set(key, value, ttl)
+	if err == nil || !strings.Contains(err.Error(), "failed to set cache entry") {
+		t.Fatalf("Expected DB write error, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCacheSetNoDB(t *testing.T) {
+	cachePlugin, corePlugin, _ := newTestCachePlugin(t)
+	corePlugin.db = nil // Simulate no DB connection
+
+	err := cachePlugin.Set("key", "value", 1*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "database connection not available") {
+		t.Fatalf("Expected DB connection error, got: %v", err)
+	}
+}
+
+func TestCacheGetHit(t *testing.T) {
+	cachePlugin, _, mock := newTestCachePlugin(t)
+	key := "existkey"
+	expectedValue := "cachedata"
+
+	// Expect SELECT for the key where expires_at > NOW()
+	getSQL := "SELECT value FROM easyrest_cache WHERE `key` = ? AND expires_at > NOW()"
+	rows := sqlmock.NewRows([]string{"value"}).AddRow(expectedValue)
+	mock.ExpectQuery(regexp.QuoteMeta(getSQL)).WithArgs(key).WillReturnRows(rows)
+
+	value, err := cachePlugin.Get(key)
+	if err != nil {
+		t.Fatalf("CacheGet failed: %v", err)
+	}
+	if value != expectedValue {
+		t.Errorf("Expected value %q, got %q", expectedValue, value)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCacheGetMiss(t *testing.T) {
+	cachePlugin, _, mock := newTestCachePlugin(t)
+	key := "nonexistkey"
+
+	// Expect SELECT, return sql.ErrNoRows
+	getSQL := "SELECT value FROM easyrest_cache WHERE `key` = ? AND expires_at > NOW()"
+	mock.ExpectQuery(regexp.QuoteMeta(getSQL)).WithArgs(key).WillReturnError(sql.ErrNoRows)
+
+	_, err := cachePlugin.Get(key)
+	if !errors.Is(err, sql.ErrNoRows) { // Check for the specific error type
+		t.Fatalf("Expected sql.ErrNoRows, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCacheGetExpired(t *testing.T) {
+	cachePlugin, _, mock := newTestCachePlugin(t)
+	key := "expiredkey"
+
+	// The query itself filters expired keys, so the DB returns NoRows
+	getSQL := "SELECT value FROM easyrest_cache WHERE `key` = ? AND expires_at > NOW()"
+	mock.ExpectQuery(regexp.QuoteMeta(getSQL)).WithArgs(key).WillReturnError(sql.ErrNoRows)
+
+	_, err := cachePlugin.Get(key)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("Expected sql.ErrNoRows for expired key, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCacheGetDBError(t *testing.T) {
+	cachePlugin, _, mock := newTestCachePlugin(t)
+	key := "key"
+
+	getSQL := "SELECT value FROM easyrest_cache WHERE `key` = ? AND expires_at > NOW()"
+	mock.ExpectQuery(regexp.QuoteMeta(getSQL)).WithArgs(key).WillReturnError(errors.New("DB read error"))
+
+	_, err := cachePlugin.Get(key)
+	if err == nil || !strings.Contains(err.Error(), "failed to get cache entry") {
+		t.Fatalf("Expected DB read error, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestCacheGetNoDB(t *testing.T) {
+	cachePlugin, corePlugin, _ := newTestCachePlugin(t)
+	corePlugin.db = nil // Simulate no DB connection
+
+	_, err := cachePlugin.Get("key")
+	if err == nil || !strings.Contains(err.Error(), "database connection not available") {
+		t.Fatalf("Expected DB connection error, got: %v", err)
+	}
+}
