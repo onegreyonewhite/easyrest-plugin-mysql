@@ -18,7 +18,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.5.1"
+var Version = "v0.5.2"
 
 // rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
@@ -535,35 +535,30 @@ func (m *mysqlPlugin) CallFunction(userID, funcName string, data map[string]any,
 	} else {
 		callQuery = fmt.Sprintf("CALL %s(%s)", funcName, strings.Join(placeholders, ", "))
 	}
-	conn, err := m.db.Conn(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("failed to get connection: %w", err)
-	}
-	defer conn.Close()
-	if ctx != nil {
-		if err := m.injectContext(conn, ctx); err != nil {
-			return nil, err
+
+	// Use handleTransaction for managing the transaction and context
+	res, err := m.handleTransaction(ctx, func(tx *sql.Tx) (any, error) {
+		rows, err := tx.QueryContext(context.Background(), callQuery, callArgs...)
+		if err != nil {
+			// Error during query execution, transaction will be rolled back by handleTransaction
+			return nil, fmt.Errorf("failed to call routine: %w", err)
 		}
-	}
-	tx, err := conn.BeginTx(context.Background(), nil)
+		defer rows.Close()
+		result, err := scanRows(rows)
+		if err != nil {
+			// Error during scanning, transaction will be rolled back by handleTransaction
+			return nil, fmt.Errorf("failed to scan routine result: %w", err)
+		}
+		// Return the scanned result. Commit/Rollback is handled by handleTransaction.
+		return result, nil
+	})
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin tx: %w", err)
+		return nil, err // Error already includes context from handleTransaction or the operation
 	}
-	rows, err := tx.QueryContext(context.Background(), callQuery, callArgs...)
-	if err != nil {
-		tx.Rollback()
-		return nil, fmt.Errorf("failed to call routine: %w", err)
-	}
-	defer rows.Close()
-	result, err := scanRows(rows)
-	if err != nil {
-		tx.Rollback()
-		return nil, fmt.Errorf("failed to scan routine result: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit: %w", err)
-	}
-	return result, nil
+
+	// Return the result obtained from handleTransaction
+	return res, nil
 }
 
 // handleTransaction manages the transaction lifecycle including context injection and conditional commit/rollback.
