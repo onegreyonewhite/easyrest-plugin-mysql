@@ -6,17 +6,28 @@ on:
   pull_request:
     branches: [ main, master, develop ]
 
+# Prevent concurrent runs for the same branch to avoid race conditions when tagging
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-24.04
+    # Add contents: write permission for pushing tags
+    permissions:
+      contents: write # Needed to push tags
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        # Fetch all tags to check for existing tags
+        with:
+          fetch-depth: 0 # Fetches all history and tags
 
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: 1.23
+          go-version: '1.24'
 
       - name: Run tests with coverage
         run: |
@@ -29,3 +40,53 @@ jobs:
         with:
           name: coverage-report
           path: cover.out
+
+      # --- New steps for tagging master branch --- 
+      - name: Get Plugin Version
+        # Only run on push to master
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        id: get_version
+        run: |
+          VERSION=$(go run mysql_plugin.go -version)
+          # Basic validation of the version format (e.g., vX.Y.Z)
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version format extracted: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Check if tag exists
+        # Only run on push to master
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        id: check_tag
+        run: |
+          VERSION=${{ steps.get_version.outputs.version }}
+          # Check if tag exists locally (fetch-depth: 0 ensures all tags are available)
+          if git rev-parse --verify --quiet "refs/tags/$VERSION"; then
+            echo "Tag $VERSION already exists."
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Tag $VERSION does not exist. Proceeding to create tag."
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create and Push Tag
+        # Only run if:
+        # 1. It's a push event
+        # 2. It's the master branch
+        # 3. The tag doesn't already exist (checked in previous step)
+        if: steps.check_tag.outputs.exists == 'false' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        env:
+           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Explicitly use the token
+        run: |
+          VERSION=${{ steps.get_version.outputs.version }}
+          echo "Creating tag $VERSION..."
+          # Configure git user for tagging (recommended for traceability)
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          # Create the tag
+          git tag "$VERSION"
+          echo "Pushing tag $VERSION..."
+          # Push the specific tag to the remote repository
+          git push origin "$VERSION"

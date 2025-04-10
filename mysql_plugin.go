@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,11 +13,12 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/goccy/go-json"
 	hplugin "github.com/hashicorp/go-plugin"
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.5.0"
+var Version = "v0.5.1"
 
 // rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
@@ -362,8 +362,8 @@ func (m *mysqlPlugin) GetSchema(ctx map[string]any) (any, error) {
 func (m *mysqlPlugin) getTablesSchema() (map[string]any, error) {
 	result := make(map[string]any)
 	rows, err := m.db.Query(`
-SELECT TABLE_NAME, TABLE_TYPE 
-FROM INFORMATION_SCHEMA.TABLES 
+SELECT TABLE_NAME, TABLE_TYPE
+FROM INFORMATION_SCHEMA.TABLES
 WHERE TABLE_SCHEMA = DATABASE()
 `)
 	if err != nil {
@@ -566,6 +566,100 @@ func (m *mysqlPlugin) CallFunction(userID, funcName string, data map[string]any,
 	return result, nil
 }
 
+// handleTransaction manages the transaction lifecycle including context injection and conditional commit/rollback.
+func (m *mysqlPlugin) handleTransaction(ctxMap map[string]any, operation func(tx *sql.Tx) (any, error)) (any, error) {
+	conn, err := m.db.Conn(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection: %w", err)
+	}
+	defer conn.Close()
+
+	tx, err := conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin tx: %w", err)
+	}
+
+	// Default transaction preference is commit
+	txPreference := "commit"
+	isValidPreference := true
+	preferenceError := ""
+
+	if ctxMap != nil {
+		// Check and validate prefer.tx preference
+		if preferVal, ok := ctxMap["prefer"]; ok && preferVal != nil {
+			if preferMap, ok := preferVal.(map[string]any); ok {
+				if txVal, ok := preferMap["tx"]; ok && txVal != nil {
+					if txStr, ok := txVal.(string); ok && txStr != "" {
+						txPreference = strings.ToLower(txStr)
+						if txPreference != "commit" && txPreference != "rollback" {
+							isValidPreference = false
+							preferenceError = fmt.Sprintf("invalid value for prefer.tx: '%s'. Must be 'commit' or 'rollback'", txStr)
+						}
+					} else { // prefer.tx exists but is not a non-empty string
+						isValidPreference = false
+						preferenceError = fmt.Sprintf("invalid type for prefer.tx: expected non-empty string, got %T", txVal)
+					}
+				}
+				// If prefer.tx does not exist or is nil, default 'commit' is used, which is valid.
+			} else { // prefer exists but is not a map
+				isValidPreference = false
+				preferenceError = fmt.Sprintf("invalid type for prefer: expected map[string]any, got %T", preferVal)
+			}
+		}
+		// If prefer does not exist or is nil, default 'commit' is used, which is valid.
+
+		// Return error immediately if preference is invalid *before* injecting context or starting operation
+		if !isValidPreference {
+			// No need to rollback tx as nothing has happened yet.
+			return nil, errors.New(preferenceError)
+		}
+
+		// Inject context *after* validating preference, but before the main operation
+		if err := m.injectContext(conn, ctxMap); err != nil {
+			tx.Rollback() // Rollback on injection error
+			return nil, fmt.Errorf("failed to inject context: %w", err)
+		}
+	}
+
+	// Execute the core operation
+	result, err := operation(tx)
+	if err != nil {
+		tx.Rollback()   // Rollback on operation error
+		return nil, err // Return the original error from the operation
+	}
+
+	// Commit or Rollback based on preference
+	if txPreference == "rollback" {
+		if err := tx.Rollback(); err != nil {
+			// Even rollback can fail, though it's less critical than a failed commit
+			return nil, fmt.Errorf("failed to rollback transaction: %w", err)
+		}
+		// Modify result for Update/Delete if rollback occurred
+		// For Update/Delete, the operation returns int(affectedRows). If rolled back, return 0.
+		// For Create, the operation returns []map[string]any (input data). Return it as is.
+		switch res := result.(type) {
+		case int: // Assumed from TableUpdate/TableDelete
+			return 0, nil
+		case int64: // Handle potential int64 return from RowsAffected directly
+			return int64(0), nil
+		default: // Assumed from TableCreate or others; return original result
+			return res, nil
+		}
+	} else { // commit or default
+		if err := tx.Commit(); err != nil {
+			// Attempt rollback if commit fails, but return the commit error
+			rbErr := tx.Rollback()
+			if rbErr != nil {
+				return nil, fmt.Errorf("failed to commit transaction: %w (rollback also failed: %v)", err, rbErr)
+			}
+			return nil, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+	}
+
+	// Return the original result from the operation if committed successfully
+	return result, nil
+}
+
 // TableGet builds and executes a SELECT query.
 func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, where map[string]any,
 	ordering []string, groupBy []string, limit, offset int, ctx map[string]any) ([]map[string]any, error) {
@@ -612,138 +706,128 @@ func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, wher
 
 // TableCreate builds and executes an INSERT statement from data.
 func (m *mysqlPlugin) TableCreate(userID, table string, data []map[string]any, ctx map[string]any) ([]map[string]any, error) {
-	conn, err := m.db.Conn(context.Background())
+	res, err := m.handleTransaction(ctx, func(tx *sql.Tx) (any, error) {
+		var results []map[string]any
+		for _, row := range data {
+			var cols []string
+			var placeholders []string
+			var args []any
+			var keys []string
+			for k := range row {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				cols = append(cols, k)
+				placeholders = append(placeholders, "?")
+				args = append(args, row[k])
+			}
+			insertQ := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+			if _, err := tx.ExecContext(context.Background(), insertQ, args...); err != nil {
+				// Error occurs within the loop, transaction will be rolled back by handleTransaction
+				return nil, fmt.Errorf("failed to execute insert: %w", err)
+			}
+			// Append the original input row to results. This is returned even on rollback.
+			results = append(results, row)
+		}
+		// Return the collected input data.
+		return results, nil
+	})
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to get connection: %w", err)
+		return nil, err // Error already includes context from handleTransaction or the operation
 	}
-	defer conn.Close()
-	tx, err := conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin tx: %w", err)
+
+	// Type assertion for the result
+	if results, ok := res.([]map[string]any); ok {
+		return results, nil
 	}
-	if ctx != nil {
-		if err := m.injectContext(conn, ctx); err != nil {
-			tx.Rollback()
-			return nil, err
-		}
-	}
-	var results []map[string]any
-	for _, row := range data {
-		var cols []string
-		var placeholders []string
-		var args []any
-		var keys []string
-		for k := range row {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			cols = append(cols, k)
-			placeholders = append(placeholders, "?")
-			args = append(args, row[k])
-		}
-		insertQ := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-		if _, err := tx.ExecContext(context.Background(), insertQ, args...); err != nil {
-			tx.Rollback()
-			return nil, fmt.Errorf("failed to execute insert: %w", err)
-		}
-		results = append(results, row)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit: %w", err)
-	}
-	return results, nil
+	// This should ideally not happen if handleTransaction works correctly.
+	return nil, fmt.Errorf("unexpected result type from handleTransaction: %T", res)
 }
 
 // TableUpdate builds and executes an UPDATE statement.
 func (m *mysqlPlugin) TableUpdate(userID, table string, data map[string]any, where map[string]any, ctx map[string]any) (int, error) {
-	conn, err := m.db.Conn(context.Background())
-	if err != nil {
-		return 0, fmt.Errorf("failed to get connection: %w", err)
-	}
-	defer conn.Close()
-	tx, err := conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin tx: %w", err)
-	}
-	if ctx != nil {
-		if err := m.injectContext(conn, ctx); err != nil {
-			tx.Rollback()
-			return 0, err
+	res, err := m.handleTransaction(ctx, func(tx *sql.Tx) (any, error) {
+		var keys []string
+		for k := range data {
+			keys = append(keys, k)
 		}
-	}
-	var keys []string
-	for k := range data {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var setParts []string
-	var args []any
-	for _, k := range keys {
-		setParts = append(setParts, fmt.Sprintf("%s = ?", k))
-		args = append(args, data[k])
-	}
-	updateQ := fmt.Sprintf("UPDATE %s SET %s", table, strings.Join(setParts, ", "))
-	whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
+		sort.Strings(keys)
+		var setParts []string
+		var args []any
+		for _, k := range keys {
+			setParts = append(setParts, fmt.Sprintf("%s = ?", k))
+			args = append(args, data[k])
+		}
+		updateQ := fmt.Sprintf("UPDATE %s SET %s", table, strings.Join(setParts, ", "))
+		whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
+		if err != nil {
+			// Error in building WHERE clause, transaction will be rolled back
+			return 0, fmt.Errorf("failed to build WHERE: %w", err)
+		}
+		updateQ += whereClause
+		args = append(args, whereArgs...)
+		sqlRes, err := tx.ExecContext(context.Background(), updateQ, args...)
+		if err != nil {
+			// Error during execution, transaction will be rolled back
+			return 0, fmt.Errorf("failed to execute update: %w", err)
+		}
+		affected, err := sqlRes.RowsAffected()
+		if err != nil {
+			// Error getting affected rows, transaction will be rolled back
+			return 0, fmt.Errorf("failed to get rowsAffected: %w", err)
+		}
+		// Return the number of affected rows (as int64 for safety, handleTransaction will convert if needed).
+		return int(affected), nil // Return as int directly
+	})
+
 	if err != nil {
-		tx.Rollback()
-		return 0, fmt.Errorf("failed to build WHERE: %w", err)
+		return 0, err // Error already includes context from handleTransaction or the operation
 	}
-	updateQ += whereClause
-	args = append(args, whereArgs...)
-	res, err := tx.ExecContext(context.Background(), updateQ, args...)
-	if err != nil {
-		tx.Rollback()
-		return 0, fmt.Errorf("failed to execute update: %w", err)
+
+	// Type assertion for the result
+	if affected, ok := res.(int); ok {
+		return affected, nil
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		tx.Rollback()
-		return 0, fmt.Errorf("failed to get rowsAffected: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit: %w", err)
-	}
-	return int(affected), nil
+	// This should ideally not happen if handleTransaction works correctly.
+	return 0, fmt.Errorf("unexpected result type from handleTransaction: %T", res)
+
 }
 
 // TableDelete builds and executes a DELETE statement.
 func (m *mysqlPlugin) TableDelete(userID, table string, where map[string]any, ctx map[string]any) (int, error) {
-	conn, err := m.db.Conn(context.Background())
-	if err != nil {
-		return 0, fmt.Errorf("failed to get connection: %w", err)
-	}
-	defer conn.Close()
-	tx, err := conn.BeginTx(context.Background(), nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin tx: %w", err)
-	}
-	if ctx != nil {
-		if err := m.injectContext(conn, ctx); err != nil {
-			tx.Rollback()
-			return 0, err
+	res, err := m.handleTransaction(ctx, func(tx *sql.Tx) (any, error) {
+		whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
+		if err != nil {
+			// Error in building WHERE clause, transaction will be rolled back
+			return 0, fmt.Errorf("failed to build WHERE: %w", err)
 		}
-	}
-	whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
+		delQ := fmt.Sprintf("DELETE FROM %s%s", table, whereClause)
+		sqlRes, err := tx.ExecContext(context.Background(), delQ, whereArgs...)
+		if err != nil {
+			// Error during execution, transaction will be rolled back
+			return 0, fmt.Errorf("failed to execute delete: %w", err)
+		}
+		affected, err := sqlRes.RowsAffected()
+		if err != nil {
+			// Error getting affected rows, transaction will be rolled back
+			return 0, fmt.Errorf("failed to retrieve rowsAffected: %w", err)
+		}
+		// Return the number of affected rows (as int64 for safety, handleTransaction will convert if needed).
+		return int(affected), nil // Return as int directly
+	})
+
 	if err != nil {
-		tx.Rollback()
-		return 0, fmt.Errorf("failed to build WHERE: %w", err)
+		return 0, err // Error already includes context from handleTransaction or the operation
 	}
-	delQ := fmt.Sprintf("DELETE FROM %s%s", table, whereClause)
-	res, err := tx.ExecContext(context.Background(), delQ, whereArgs...)
-	if err != nil {
-		tx.Rollback()
-		return 0, fmt.Errorf("failed to execute delete: %w", err)
+
+	// Type assertion for the result
+	if affected, ok := res.(int); ok {
+		return affected, nil
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		tx.Rollback()
-		return 0, fmt.Errorf("failed to retrieve rowsAffected: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit: %w", err)
-	}
-	return int(affected), nil
+	// This should ideally not happen if handleTransaction works correctly.
+	return 0, fmt.Errorf("unexpected result type from handleTransaction: %T", res)
 }
 
 // mysqlCachePlugin implements the CachePlugin interface using MySQL.
@@ -786,7 +870,7 @@ func (p *mysqlCachePlugin) InitConnection(uri string) error {
 
 	// Create cache table if it doesn't exist
 	// Use DATETIME for expires_at in MySQL
-	createTableSQL := "CREATE TABLE IF NOT EXISTS easyrest_cache (`key` VARCHAR(255) PRIMARY KEY, value TEXT, expires_at DATETIME)"
+	createTableSQL := "CREATE TABLE IF NOT EXISTS easyrest_cache (`key` VARCHAR(255) PRIMARY KEY, value TEXT, expires_at DATETIME) ENGINE = MEMORY"
 
 	// Use a background context as table creation is an initialization step.
 	_, err = p.dbPluginPointer.db.ExecContext(context.Background(), createTableSQL)
