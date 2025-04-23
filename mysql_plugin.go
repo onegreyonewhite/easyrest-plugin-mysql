@@ -18,7 +18,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.5.2"
+var Version = "v0.6.0"
 
 // rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
@@ -655,6 +655,58 @@ func (m *mysqlPlugin) handleTransaction(ctxMap map[string]any, operation func(tx
 	return result, nil
 }
 
+// convertILIKEtoLower transforms ILIKE operations in a WHERE clause map
+// to use LOWER() on both the column and the value with a LIKE operator.
+// Other operators for the same field remain unchanged.
+func convertILIKEtoLower(where map[string]any) map[string]any {
+	if where == nil {
+		return nil
+	}
+	result := make(map[string]any, len(where))
+	for field, condition := range where {
+		switch conditionMap := condition.(type) {
+		case map[string]any:
+			// This field has operator(s) defined in a map
+			newConditions := make(map[string]any) // For operators other than ILIKE
+			foundILIKE := false
+
+			for op, operand := range conditionMap {
+				if strings.EqualFold(op, "ILIKE") {
+					operandStr, ok := operand.(string)
+					if ok {
+						// Handle ILIKE: Create LOWER(field) LIKE lower(value)
+						lowerOperand := strings.ToLower(operandStr)
+						lowerFieldKey := fmt.Sprintf("LOWER(%s)", field)
+						result[lowerFieldKey] = map[string]any{"LIKE": lowerOperand}
+						foundILIKE = true
+					} else {
+						// ILIKE operand is not a string, keep original op
+						newConditions[op] = operand
+					}
+				} else {
+					// Keep other operators associated with the original field name
+					newConditions[op] = operand
+				}
+			}
+
+			// If there were non-ILIKE operators, add them to the result under the original field name
+			if len(newConditions) > 0 {
+				result[field] = newConditions
+			} else if !foundILIKE {
+				// If the map only contained non-string ILIKE, add the original back
+				// This case is unlikely but handles potential edge scenarios.
+				result[field] = conditionMap
+			}
+
+		default:
+			// This is a direct equality check (e.g., "field": "value") or other non-map condition.
+			// Keep it as is.
+			result[field] = condition
+		}
+	}
+	return result
+}
+
 // TableGet builds and executes a SELECT query.
 func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, where map[string]any,
 	ordering []string, groupBy []string, limit, offset int, ctx map[string]any) ([]map[string]any, error) {
@@ -664,7 +716,8 @@ func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, wher
 		fields = strings.Join(selectFields, ", ")
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s", fields, table)
-	whereClause, args, err := easyrest.BuildWhereClause(where)
+	processedWhere := convertILIKEtoLower(where)
+	whereClause, args, err := easyrest.BuildWhereClauseSorted(processedWhere)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build WHERE: %w", err)
 	}
@@ -756,7 +809,8 @@ func (m *mysqlPlugin) TableUpdate(userID, table string, data map[string]any, whe
 			args = append(args, data[k])
 		}
 		updateQ := fmt.Sprintf("UPDATE %s SET %s", table, strings.Join(setParts, ", "))
-		whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
+		processedWhere := convertILIKEtoLower(where)
+		whereClause, whereArgs, err := easyrest.BuildWhereClauseSorted(processedWhere)
 		if err != nil {
 			// Error in building WHERE clause, transaction will be rolled back
 			return 0, fmt.Errorf("failed to build WHERE: %w", err)
@@ -787,13 +841,13 @@ func (m *mysqlPlugin) TableUpdate(userID, table string, data map[string]any, whe
 	}
 	// This should ideally not happen if handleTransaction works correctly.
 	return 0, fmt.Errorf("unexpected result type from handleTransaction: %T", res)
-
 }
 
 // TableDelete builds and executes a DELETE statement.
 func (m *mysqlPlugin) TableDelete(userID, table string, where map[string]any, ctx map[string]any) (int, error) {
 	res, err := m.handleTransaction(ctx, func(tx *sql.Tx) (any, error) {
-		whereClause, whereArgs, err := easyrest.BuildWhereClause(where)
+		processedWhere := convertILIKEtoLower(where)
+		whereClause, whereArgs, err := easyrest.BuildWhereClauseSorted(processedWhere)
 		if err != nil {
 			// Error in building WHERE clause, transaction will be rolled back
 			return 0, fmt.Errorf("failed to build WHERE: %w", err)

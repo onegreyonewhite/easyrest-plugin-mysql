@@ -205,14 +205,17 @@ func TestTableGetGroupByOrderingLimitOffset(t *testing.T) {
 	defer plugin.db.Close()
 
 	sf := []string{"id", "name"}
-	where := map[string]interface{}{}
+	where := map[string]interface{}{
+		"status": "active",
+		"name":   map[string]any{"ILIKE": "JoHn%"},
+	}
 	gb := []string{"name"}
 	ordering := []string{"id DESC"}
 	limit := 10
 	offset := 5
-	expQ := "SELECT id, name FROM users GROUP BY name ORDER BY id DESC LIMIT 10 OFFSET 5"
+	expQ := "SELECT id, name FROM users WHERE LOWER(name) LIKE ? AND status = ? GROUP BY name ORDER BY id DESC LIMIT 10 OFFSET 5"
 	mock.ExpectQuery(regexp.QuoteMeta(expQ)).
-		WithArgs().
+		WithArgs("john%", "active").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).AddRow(1, "John Doe"))
 
 	res, err := plugin.TableGet("u", "users", sf, where, ordering, gb, limit, offset, nil)
@@ -482,7 +485,8 @@ func TestTableUpdateWithContext2(t *testing.T) {
 	}
 	// The where clause
 	where := map[string]interface{}{
-		"id": map[string]interface{}{"=": 1},
+		"id":     map[string]interface{}{"=": 1},
+		"region": map[string]any{"ILIKE": "EaSt"}, // Add ILIKE
 	}
 	// ctx has keys in random order: "xxx", "abc"
 	ctxData := map[string]interface{}{
@@ -499,10 +503,10 @@ func TestTableUpdateWithContext2(t *testing.T) {
 		WithArgs("222", "222", "111", "111").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
-	// Then the update
-	upQ := regexp.QuoteMeta("UPDATE items SET note = ?, qty = ? WHERE id = ?")
+	// Then the update, expect LOWER(region) LIKE ? and lowercased arg
+	upQ := regexp.QuoteMeta("UPDATE items SET note = ?, qty = ? WHERE LOWER(region) LIKE ? AND id = ?")
 	mock.ExpectExec(upQ).
-		WithArgs("SomeNote", 42, 1).
+		WithArgs("SomeNote", 42, "east", 1).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	mock.ExpectCommit()
@@ -526,6 +530,7 @@ func TestTableDeleteWithContext2(t *testing.T) {
 
 	where := map[string]interface{}{
 		"status": map[string]interface{}{"=": "old"},
+		"tag":    map[string]any{"ILIKE": "DeLeTeMe"}, // Add ILIKE
 	}
 	ctxData := map[string]interface{}{
 		"ccc": "111",
@@ -539,9 +544,10 @@ func TestTableDeleteWithContext2(t *testing.T) {
 		WithArgs("222", "222", "111", "111").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
-	delQ := regexp.QuoteMeta("DELETE FROM items WHERE status = ?")
+	// Then the delete, expect LOWER(tag) LIKE ? and lowercased arg
+	delQ := regexp.QuoteMeta("DELETE FROM items WHERE LOWER(tag) LIKE ? AND status = ?")
 	mock.ExpectExec(delQ).
-		WithArgs("old").
+		WithArgs("deleteme", "old").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	mock.ExpectCommit()
@@ -762,5 +768,133 @@ func TestCacheGetNoDB(t *testing.T) {
 	_, err := cachePlugin.Get("key")
 	if err == nil || !strings.Contains(err.Error(), "database connection not available") {
 		t.Fatalf("Expected DB connection error, got: %v", err)
+	}
+}
+
+func TestConvertILIKEtoLower(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    map[string]any
+		expected map[string]any
+	}{
+		{
+			name: "Basic ILIKE conversion",
+			input: map[string]any{
+				"name": map[string]any{"ILIKE": "TeSt%"},
+			},
+			expected: map[string]any{
+				"LOWER(name)": map[string]any{"LIKE": "test%"},
+			},
+		},
+		{
+			name: "ILIKE with other operators",
+			input: map[string]any{
+				"description": map[string]any{"ILIKE": "%CaSe%", ">": 10},
+			},
+			expected: map[string]any{
+				"LOWER(description)": map[string]any{"LIKE": "%case%"},
+				"description":        map[string]any{">": 10},
+			},
+		},
+		{
+			name: "ILIKE with non-string operand",
+			input: map[string]any{
+				"status": map[string]any{"ILIKE": 123},
+			},
+			expected: map[string]any{
+				"status": map[string]any{"ILIKE": 123},
+			},
+		},
+		{
+			name: "No ILIKE operator",
+			input: map[string]any{
+				"age": map[string]any{">=": 30},
+			},
+			expected: map[string]any{
+				"age": map[string]any{">=": 30},
+			},
+		},
+		{
+			name: "Mix of ILIKE and equality",
+			input: map[string]any{
+				"city":   "New York",
+				"street": map[string]any{"ILIKE": "BROADWAY"},
+			},
+			expected: map[string]any{
+				"city":          "New York",
+				"LOWER(street)": map[string]any{"LIKE": "broadway"},
+			},
+		},
+		{
+			name:     "Nil input map",
+			input:    nil,
+			expected: nil,
+		},
+		{
+			name:     "Empty input map",
+			input:    map[string]any{},
+			expected: map[string]any{},
+		},
+		{
+			name: "ILIKE mixed with non-map equality on same conceptual field",
+			// This scenario is less likely in practice but tests robustness
+			input: map[string]any{
+				"tag":         "IMPORTANT",
+				"tag_details": map[string]any{"ILIKE": "UrGeNt"},
+			},
+			expected: map[string]any{
+				"tag":                "IMPORTANT",
+				"LOWER(tag_details)": map[string]any{"LIKE": "urgent"},
+			},
+		},
+		{
+			name: "Field name requiring quoting (if BuildWhereClause handles it)",
+			// Assuming BuildWhereClause handles quoting if needed
+			input: map[string]any{
+				"user name": map[string]any{"ILIKE": "JoHn Doe"},
+			},
+			expected: map[string]any{
+				"LOWER(user name)": map[string]any{"LIKE": "john doe"},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := convertILIKEtoLower(tc.input)
+			// Simple comparison for maps (order doesn't matter)
+			if len(actual) != len(tc.expected) {
+				t.Fatalf("Expected map length %d, got %d. Expected: %v, Got: %v", len(tc.expected), len(actual), tc.expected, actual)
+			}
+			for k, vExp := range tc.expected {
+				vAct, ok := actual[k]
+				if !ok {
+					t.Fatalf("Missing key in actual: %s. Expected: %v, Got: %v", k, tc.expected, actual)
+				}
+				// Compare nested maps if necessary
+				if expMap, okExp := vExp.(map[string]any); okExp {
+					actMap, okAct := vAct.(map[string]any)
+					if !okAct {
+						t.Fatalf("Type mismatch for key '%s'. Expected map, got %T. Expected: %v, Got: %v", k, vAct, tc.expected, actual)
+					}
+					if len(expMap) != len(actMap) {
+						t.Fatalf("Nested map length mismatch for key '%s'. Expected %d, got %d. Expected: %v, Got: %v", k, len(expMap), len(actMap), tc.expected, actual)
+					}
+					for nk, nvExp := range expMap {
+						nvAct, ok := actMap[nk]
+						if !ok {
+							t.Fatalf("Missing nested key '%s' under key '%s'. Expected: %v, Got: %v", nk, k, tc.expected, actual)
+						}
+						if nvExp != nvAct {
+							t.Fatalf("Value mismatch for nested key '%s' under key '%s'. Expected: %v, Got: %v. Full Expected: %v, Got: %v", nk, k, nvExp, nvAct, tc.expected, actual)
+						}
+					}
+				} else {
+					if vAct != vExp {
+						t.Fatalf("Value mismatch for key '%s'. Expected: %v, Got: %v. Full Expected: %v, Got: %v", k, vExp, vAct, tc.expected, actual)
+					}
+				}
+			}
+		})
 	}
 }
