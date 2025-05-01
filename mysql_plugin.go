@@ -18,7 +18,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.6.0"
+var Version = "v0.6.1"
 
 // rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
@@ -576,37 +576,11 @@ func (m *mysqlPlugin) handleTransaction(ctxMap map[string]any, operation func(tx
 
 	// Default transaction preference is commit
 	txPreference := "commit"
-	isValidPreference := true
-	preferenceError := ""
 
 	if ctxMap != nil {
-		// Check and validate prefer.tx preference
-		if preferVal, ok := ctxMap["prefer"]; ok && preferVal != nil {
-			if preferMap, ok := preferVal.(map[string]any); ok {
-				if txVal, ok := preferMap["tx"]; ok && txVal != nil {
-					if txStr, ok := txVal.(string); ok && txStr != "" {
-						txPreference = strings.ToLower(txStr)
-						if txPreference != "commit" && txPreference != "rollback" {
-							isValidPreference = false
-							preferenceError = fmt.Sprintf("invalid value for prefer.tx: '%s'. Must be 'commit' or 'rollback'", txStr)
-						}
-					} else { // prefer.tx exists but is not a non-empty string
-						isValidPreference = false
-						preferenceError = fmt.Sprintf("invalid type for prefer.tx: expected non-empty string, got %T", txVal)
-					}
-				}
-				// If prefer.tx does not exist or is nil, default 'commit' is used, which is valid.
-			} else { // prefer exists but is not a map
-				isValidPreference = false
-				preferenceError = fmt.Sprintf("invalid type for prefer: expected map[string]any, got %T", preferVal)
-			}
-		}
-		// If prefer does not exist or is nil, default 'commit' is used, which is valid.
-
-		// Return error immediately if preference is invalid *before* injecting context or starting operation
-		if !isValidPreference {
-			// No need to rollback tx as nothing has happened yet.
-			return nil, errors.New(preferenceError)
+		txPreference, err = easyrest.GetTxPreference(ctxMap)
+		if err != nil {
+			return nil, err
 		}
 
 		// Inject context *after* validating preference, but before the main operation
