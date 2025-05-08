@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 	easyrest "github.com/onegreyonewhite/easyrest/plugin"
 )
 
-var Version = "v0.6.1"
+var Version = "v0.6.2"
 
 // rowScanner is the interface needed by scanRows to fetch results.
 type rowScanner interface {
@@ -424,11 +425,10 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
 		if isPri {
 			// readOnly => not required
 			prop["readOnly"] = true
-		} else {
-			if strings.ToUpper(nullable.String) == "NO" && !defv.Valid {
-				required = append(required, colName.String)
-			}
+		} else if strings.ToUpper(nullable.String) == "NO" && !defv.Valid {
+			required = append(required, colName.String)
 		}
+
 		properties[colName.String] = prop
 	}
 	schema := map[string]any{
@@ -685,30 +685,42 @@ func convertILIKEtoLower(where map[string]any) map[string]any {
 func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, where map[string]any,
 	ordering []string, groupBy []string, limit, offset int, ctx map[string]any) ([]map[string]any, error) {
 
-	fields := "*"
+	var query strings.Builder
+	query.WriteString("SELECT ")
 	if len(selectFields) > 0 {
-		fields = strings.Join(selectFields, ", ")
+		query.WriteString(strings.Join(selectFields, ", "))
+	} else {
+		query.WriteString("*")
 	}
-	query := fmt.Sprintf("SELECT %s FROM %s", fields, table)
+	query.WriteString(" FROM ")
+	query.WriteString(table)
+
 	processedWhere := convertILIKEtoLower(where)
 	whereClause, args, err := easyrest.BuildWhereClauseSorted(processedWhere)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build WHERE: %w", err)
 	}
-	query += whereClause
+	query.WriteString(whereClause)
 	if len(groupBy) > 0 {
-		query += " GROUP BY " + strings.Join(groupBy, ", ")
+		query.WriteString(" GROUP BY ")
+		query.WriteString(strings.Join(groupBy, ", "))
 	}
 	if len(ordering) > 0 {
-		query += " ORDER BY " + strings.Join(ordering, ", ")
+		query.WriteString(" ORDER BY ")
+		query.WriteString(strings.Join(ordering, ", "))
 	}
 	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+		query.WriteString(" LIMIT ")
+		query.WriteString(strconv.Itoa(limit))
 	}
 	if offset > 0 {
-		query += fmt.Sprintf(" OFFSET %d", offset)
+		query.WriteString(" OFFSET ")
+		query.WriteString(strconv.Itoa(offset))
 	}
-	conn, err := m.db.Conn(context.Background())
+
+	queryCtx := context.Background()
+
+	conn, err := m.db.Conn(queryCtx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
@@ -718,7 +730,7 @@ func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, wher
 			return nil, err
 		}
 	}
-	rows, err := conn.QueryContext(context.Background(), query, args...)
+	rows, err := conn.QueryContext(queryCtx, query.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -730,6 +742,7 @@ func (m *mysqlPlugin) TableGet(userID, table string, selectFields []string, wher
 func (m *mysqlPlugin) TableCreate(userID, table string, data []map[string]any, ctx map[string]any) ([]map[string]any, error) {
 	res, err := m.handleTransaction(ctx, func(tx *sql.Tx) (any, error) {
 		var results []map[string]any
+		queryCtx := context.Background()
 		for _, row := range data {
 			var cols []string
 			var placeholders []string
@@ -745,7 +758,7 @@ func (m *mysqlPlugin) TableCreate(userID, table string, data []map[string]any, c
 				args = append(args, row[k])
 			}
 			insertQ := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-			if _, err := tx.ExecContext(context.Background(), insertQ, args...); err != nil {
+			if _, err := tx.ExecContext(queryCtx, insertQ, args...); err != nil {
 				// Error occurs within the loop, transaction will be rolled back by handleTransaction
 				return nil, fmt.Errorf("failed to execute insert: %w", err)
 			}
@@ -913,6 +926,7 @@ func (p *mysqlCachePlugin) InitConnection(uri string) error {
 func (p *mysqlCachePlugin) cleanupExpiredCacheEntries() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
+	queryCtx := context.Background()
 
 	for range ticker.C {
 		if p.dbPluginPointer.db == nil {
@@ -921,7 +935,7 @@ func (p *mysqlCachePlugin) cleanupExpiredCacheEntries() {
 		}
 		// Use NOW() for current time in MySQL
 		// Use background context for cleanup task.
-		_, err := p.dbPluginPointer.db.ExecContext(context.Background(), "DELETE FROM easyrest_cache WHERE expires_at <= NOW()")
+		_, err := p.dbPluginPointer.db.ExecContext(queryCtx, "DELETE FROM easyrest_cache WHERE expires_at <= NOW()")
 		if err != nil {
 			// Log the error, but continue running the cleanup
 			fmt.Printf("Error cleaning up expired cache entries: %v\n", err) // Use fmt.Printf
